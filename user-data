@@ -1,0 +1,114 @@
+#cloud-config
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # ── Identity ──────────────────────────────────────────────────────
+  identity:
+    hostname: k3s-node
+    # Default user: k3sadmin / k3sadmin  (change the hash for production)
+    username: k3sadmin
+    # mkpasswd --method=SHA-512 k3sadmin
+    password: "$6$rounds=4096$randomsalt$ZxC9V8z5N0J1YJqXkEfK3qF7JhV2n5R8wS6tP4mA1bD0gH3iL5oU7yW9xQ2eR4vT6cB8nM0jK1fG3hD5sA7p."
+
+  # ── SSH ────────────────────────────────────────────────────────────
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # ── Storage: wipe entire target disk ──────────────────────────────
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+    # The installer picks the first non-USB, non-removable disk automatically.
+    # If you need to target a specific disk, replace the layout block with:
+    #   config:
+    #     - { type: disk, id: disk0, ptable: gpt, path: /dev/sda, wipe: superblock, grub_device: true }
+    #     ...
+
+  # ── Packages to install during OS setup ───────────────────────────
+  packages:
+    - curl
+    - open-iscsi
+    - nfs-common
+    - net-tools
+    - jq
+    - htop
+    - bash-completion
+    - avahi-daemon
+    - avahi-utils
+
+  # ── Network: use DHCP on all NICs ─────────────────────────────────
+  network:
+    version: 2
+    ethernets:
+      id0:
+        match:
+          name: "en*"
+        dhcp4: true
+      id1:
+        match:
+          name: "eth*"
+        dhcp4: true
+
+  # ── Late commands: inject our custom scripts into the target OS ───
+  late-commands:
+    # Copy the k3s scripts from the installer media into the target
+    - mkdir -p /target/opt/k3s-bootstrap
+    # The scripts live on the USB at /cdrom/k3s-scripts/
+    - cp /cdrom/k3s-scripts/first-boot.sh  /target/opt/k3s-bootstrap/first-boot.sh
+    - cp /cdrom/k3s-scripts/every-boot.sh  /target/opt/k3s-bootstrap/every-boot.sh
+    - cp /cdrom/k3s-scripts/k3s-config.env /target/opt/k3s-bootstrap/k3s-config.env
+    - chmod +x /target/opt/k3s-bootstrap/first-boot.sh
+    - chmod +x /target/opt/k3s-bootstrap/every-boot.sh
+
+    # Create a systemd oneshot service for first boot
+    - |
+      cat <<'UNIT' > /target/etc/systemd/system/k3s-first-boot.service
+      [Unit]
+      Description=K3s first-boot cluster setup
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/opt/k3s-bootstrap/.first-boot-pending
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/first-boot.sh
+      ExecStartPost=/bin/rm -f /opt/k3s-bootstrap/.first-boot-pending
+      RemainAfterExit=true
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+
+    # Create a systemd service for every boot
+    - |
+      cat <<'UNIT' > /target/etc/systemd/system/k3s-every-boot.service
+      [Unit]
+      Description=K3s every-boot maintenance
+      After=network-online.target k3s-first-boot.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/every-boot.sh
+      RemainAfterExit=true
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+
+    # Enable both services and create the first-boot sentinel file
+    - curtin in-target -- systemctl enable k3s-first-boot.service
+    - curtin in-target -- systemctl enable k3s-every-boot.service
+    - touch /target/opt/k3s-bootstrap/.first-boot-pending
+
+  # ── Shutdown after install so the USB can be removed ──────────────
+  shutdown: poweroff

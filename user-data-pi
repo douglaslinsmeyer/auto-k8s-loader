@@ -1,0 +1,38 @@
+#cloud-config
+# ── Pi 5 Cloud-Init User Data ────────────────────────────────────────
+# This runs when the Pi first boots from USB.
+# Sets up the user, SSH, and essential packages.
+# The NVMe clone and k3s setup are handled by systemd services.
+
+hostname: k3s-pi-node
+
+users:
+  - name: k3sadmin
+    # Password: k3sadmin (change for production with: mkpasswd --method=SHA-512)
+    passwd: "$6$rounds=4096$randomsalt$ZxC9V8z5N0J1YJqXkEfK3qF7JhV2n5R8wS6tP4mA1bD0gH3iL5oU7yW9xQ2eR4vT6cB8nM0jK1fG3hD5sA7p."
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo, adm
+
+ssh_pwauth: true
+
+package_update: true
+packages:
+  - curl
+  - open-iscsi
+  - nfs-common
+  - net-tools
+  - jq
+  - htop
+  - bash-completion
+  - avahi-daemon
+  - avahi-utils
+  - parted
+  - dosfstools
+  - rsync
+  - rpi-eeprom
+
+# Disable the default ubuntu user creation prompt
+chpasswd:
+  expire: false
