@@ -291,7 +291,7 @@ mount -o loop,ro "$X86_ISO" "$MNT_ISO" || die "Could not mount ISO."
 
 # Copy ISO contents to x86 installer partition
 log "  Copying x86 ISO contents to Part 2 (~2.5 GB)..."
-rsync -a --info=progress2 "$MNT_ISO/" "$MNT_X86/"
+rsync -a --info=progress2 --bwlimit=30000 "$MNT_ISO/" "$MNT_X86/"
 
 # Set up GRUB on ESP
 log "  Setting up GRUB on ESP..."
@@ -402,7 +402,7 @@ log "  Copying Pi boot partition..."
 rsync -a "$MNT_IMG_BOOT/" "$MNT_PIBOOT/"
 
 log "  Copying Pi root filesystem (this takes several minutes)..."
-rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || die "rsync failed copying Pi root filesystem."
+rsync -aAXH --info=progress2 --bwlimit=30000 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || die "rsync failed copying Pi root filesystem."
 
 umount "$MNT_IMG_BOOT"
 umount "$MNT_IMG_ROOT"
