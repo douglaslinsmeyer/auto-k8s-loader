@@ -1,0 +1,354 @@
+#cloud-config
+autoinstall:
+  version: 1
+  # ═══════════════════════════════════════════════════════════════════════
+  # K3s Auto-Installer — x86_64 Ubuntu Autoinstall
+  # ═══════════════════════════════════════════════════════════════════════
+  # Unattended Ubuntu 24.04 install for x86_64 machines.
+  # Wipes the first internal disk, installs Ubuntu, injects k3s scripts,
+  # powers off. Remove USB, power on, k3s bootstraps automatically.
+  #
+  # Boot flow:
+  #   USB UEFI boot → GRUB → Ubuntu autoinstall (wipes disk) →
+  #   late-commands inject scripts → poweroff →
+  #   [remove USB] → internal disk boot → k3s-first-boot.service → k3s
+  # ═══════════════════════════════════════════════════════════════════════
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # ── Network: DHCP on all interfaces ──────────────────────────────────
+  network:
+    version: 2
+    ethernets:
+      id0:
+        match:
+          name: "en*"
+        dhcp4: true
+      id1:
+        match:
+          name: "eth*"
+        dhcp4: true
+
+  # ── Storage: wipe first disk, LVM ───────────────────────────────────
+  storage:
+    config:
+      - id: disk0
+        type: disk
+        ptable: gpt
+        wipe: superblock-recursive
+        preserve: false
+        grub_device: false
+        match:
+          size: largest
+      - id: part-esp
+        type: partition
+        device: disk0
+        size: 512M
+        flag: boot
+        grub_device: true
+      - id: format-esp
+        type: format
+        volume: part-esp
+        fstype: fat32
+      - id: part-boot
+        type: partition
+        device: disk0
+        size: 1G
+      - id: format-boot
+        type: format
+        volume: part-boot
+        fstype: ext4
+      - id: part-root
+        type: partition
+        device: disk0
+        size: -1
+      - id: lvm-vg0
+        type: lvm_volgroup
+        name: vg0
+        devices:
+          - part-root
+      - id: lvm-root
+        type: lvm_partition
+        volgroup: lvm-vg0
+        name: lv-root
+        size: 100%
+      - id: format-root
+        type: format
+        volume: lvm-root
+        fstype: ext4
+      - id: mount-root
+        type: mount
+        device: format-root
+        path: /
+      - id: mount-boot
+        type: mount
+        device: format-boot
+        path: /boot
+      - id: mount-esp
+        type: mount
+        device: format-esp
+        path: /boot/efi
+
+  # ── User ─────────────────────────────────────────────────────────────
+  identity:
+    hostname: k3s-x86-node
+    username: k3sadmin
+    password: "$6$qTGjOpp7Jfk8Q3Ri$ZkTxkNDfgQlsBW3XqyGOm2jZp8KO3pGLztFWEEau4bYSTHCODFZUtgrcnlw7X0laXu0CvWyVKvQ.Mt.YQnuXE0"
+
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  packages:
+    - curl
+    - open-iscsi
+    - nfs-common
+    - net-tools
+    - jq
+    - htop
+    - bash-completion
+    - avahi-daemon
+    - avahi-utils
+
+  # ── late-commands: inject all k3s scripts onto target disk ───────────
+  # /target is the installed system's root filesystem.
+  # These run inside the installer, BEFORE reboot/poweroff.
+  late-commands:
+    - mkdir -p /target/opt/k3s-bootstrap
+
+    # ── k3s-config.env ──────────────────────────────────────────────
+    - |
+      cat > /target/opt/k3s-bootstrap/k3s-config.env <<'KEOF'
+      # K3s Bootstrap Configuration
+      K3S_VERSION=""
+      K3S_TOKEN="6b0356af7e673016c7e2929ebac564a1f00d5b0ea17f8fb549c60627946eeab6"
+      K3S_API_PORT="6443"
+      K3S_MDNS_SERVICE="_k3s-server._tcp"
+      K3S_FORCE_ROLE=""
+      K3S_EXTRA_SERVER_ARGS="--disable traefik"
+      K3S_EXTRA_AGENT_ARGS=""
+      K3S_CLUSTER_CIDR=""
+      K3S_SERVICE_CIDR=""
+      K3S_DISCOVERY_TIMEOUT=30
+      KEOF
+
+    # ── first-boot.sh ───────────────────────────────────────────────
+    - |
+      cat > /target/opt/k3s-bootstrap/first-boot.sh <<'KEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      LOG_TAG="k3s-first-boot"
+      log() { echo "[$(date -Is)] $*" | tee -a /var/log/k3s-bootstrap.log; logger -t "$LOG_TAG" "$*"; }
+
+      CONFIG="/opt/k3s-bootstrap/k3s-config.env"
+      if [[ ! -f "$CONFIG" ]]; then
+          log "ERROR: Config file $CONFIG not found. Aborting."
+          exit 1
+      fi
+      source "$CONFIG"
+
+      if [[ "${K3S_TOKEN}" == "CHANGE_ME"* ]]; then
+          log "ERROR: K3S_TOKEN has not been set."
+          exit 1
+      fi
+
+      log "Waiting for network connectivity..."
+      for i in $(seq 1 60); do
+          if ping -c1 -W2 1.1.1.1 &>/dev/null; then
+              log "Network is up."
+              break
+          fi
+          sleep 2
+      done
+
+      # Set unique hostname based on MAC
+      MAC_ADDR=$(cat /sys/class/net/$(ip -o link show | awk '!/lo/{gsub(/:$/,"",$2); print $2; exit}')/address 2>/dev/null | tr -d ':' | tail -c 7)
+      NEW_HOSTNAME="k3s-${MAC_ADDR}"
+      hostnamectl set-hostname "$NEW_HOSTNAME"
+      log "Hostname set to $NEW_HOSTNAME"
+
+      # Discover existing k3s servers via mDNS
+      log "Scanning for existing k3s cluster via mDNS (timeout: ${K3S_DISCOVERY_TIMEOUT}s)..."
+      systemctl start avahi-daemon 2>/dev/null || true
+      sleep 3
+
+      DISCOVERED_SERVER=""
+      if command -v avahi-browse &>/dev/null; then
+          BROWSE_OUTPUT=$(timeout "${K3S_DISCOVERY_TIMEOUT}" avahi-browse -rpt "$K3S_MDNS_SERVICE" 2>/dev/null || true)
+          DISCOVERED_SERVER=$(echo "$BROWSE_OUTPUT" | awk -F';' '/^=.*IPv4/ {print $8; exit}')
+      fi
+
+      ROLE=""
+      if [[ -n "${K3S_FORCE_ROLE}" ]]; then
+          ROLE="${K3S_FORCE_ROLE}"
+          log "Role forced via config: $ROLE"
+      elif [[ -n "$DISCOVERED_SERVER" ]]; then
+          ROLE="agent"
+          log "Discovered existing server at $DISCOVERED_SERVER -> joining as agent"
+      else
+          ROLE="server"
+          log "No existing cluster found -> initialising as server"
+      fi
+
+      INSTALL_URL="https://get.k3s.io"
+
+      if [[ "$ROLE" == "server" ]]; then
+          log "Installing k3s SERVER..."
+          EXTRA_ARGS="${K3S_EXTRA_SERVER_ARGS}"
+          [[ -n "${K3S_CLUSTER_CIDR}" ]] && EXTRA_ARGS+=" --cluster-cidr=${K3S_CLUSTER_CIDR}"
+          [[ -n "${K3S_SERVICE_CIDR}" ]] && EXTRA_ARGS+=" --service-cidr=${K3S_SERVICE_CIDR}"
+
+          export K3S_TOKEN="${K3S_TOKEN}"
+          export INSTALL_K3S_EXEC="server ${EXTRA_ARGS}"
+          [[ -n "${K3S_VERSION}" ]] && export INSTALL_K3S_VERSION="${K3S_VERSION}"
+          curl -sfL "$INSTALL_URL" | sh -
+
+          # Publish via mDNS
+          log "Publishing mDNS service..."
+          mkdir -p /etc/avahi/services
+          cat > /etc/avahi/services/k3s-server.service <<AVAHI
+      <?xml version="1.0" standalone='no'?>
+      <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+      <service-group>
+        <name replace-wildcards="yes">k3s-server on %h</name>
+        <service>
+          <type>${K3S_MDNS_SERVICE}</type>
+          <port>${K3S_API_PORT}</port>
+        </service>
+      </service-group>
+      AVAHI
+          systemctl restart avahi-daemon
+
+          log "Waiting for k3s server to become ready..."
+          for i in $(seq 1 120); do
+              if /usr/local/bin/k3s kubectl get nodes &>/dev/null; then
+                  log "k3s server is ready."
+                  break
+              fi
+              sleep 2
+          done
+
+          # Make kubeconfig readable and copy to user home
+          chmod 644 /etc/rancher/k3s/k3s.yaml
+          mkdir -p /home/k3sadmin/.kube
+          cp /etc/rancher/k3s/k3s.yaml /home/k3sadmin/.kube/config
+          chown -R k3sadmin:k3sadmin /home/k3sadmin/.kube
+          chmod 600 /home/k3sadmin/.kube/config
+          echo 'export KUBECONFIG=~/.kube/config' >> /home/k3sadmin/.bashrc
+      else
+          log "Installing k3s AGENT joining server ${DISCOVERED_SERVER}..."
+          export K3S_URL="https://${DISCOVERED_SERVER}:${K3S_API_PORT}"
+          export K3S_TOKEN="${K3S_TOKEN}"
+          export INSTALL_K3S_EXEC="agent ${K3S_EXTRA_AGENT_ARGS}"
+          [[ -n "${K3S_VERSION}" ]] && export INSTALL_K3S_VERSION="${K3S_VERSION}"
+          curl -sfL "$INSTALL_URL" | sh -
+          log "Waiting for k3s agent to register..."
+          sleep 15
+      fi
+
+      log "First boot complete. Role=$ROLE Host=$(hostname)"
+      KEOF
+    - chmod 755 /target/opt/k3s-bootstrap/first-boot.sh
+
+    # ── every-boot.sh ───────────────────────────────────────────────
+    - |
+      cat > /target/opt/k3s-bootstrap/every-boot.sh <<'KEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      LOG_TAG="k3s-every-boot"
+      log() { echo "[$(date -Is)] $*" | tee -a /var/log/k3s-bootstrap.log; logger -t "$LOG_TAG" "$*"; }
+
+      CONFIG="/opt/k3s-bootstrap/k3s-config.env"
+      [[ -f "$CONFIG" ]] && source "$CONFIG"
+
+      log "Waiting for network..."
+      for i in $(seq 1 30); do
+          if ip route | grep -q default; then break; fi
+          sleep 2
+      done
+
+      if systemctl is-active --quiet k3s.service 2>/dev/null; then
+          ROLE="server"
+      elif systemctl is-active --quiet k3s-agent.service 2>/dev/null; then
+          ROLE="agent"
+      else
+          ROLE="unknown"
+          log "WARNING: Could not determine k3s role."
+      fi
+
+      log "Boot detected. Role=$ROLE Host=$(hostname)"
+
+      if [[ "$ROLE" == "server" ]]; then
+          if ! systemctl is-active --quiet k3s.service 2>/dev/null; then
+              log "k3s server not running, restarting..."
+              systemctl restart k3s.service || true
+          fi
+          [[ -f /etc/avahi/services/k3s-server.service ]] && systemctl restart avahi-daemon 2>/dev/null || true
+          log "Running node health check..."
+          /usr/local/bin/k3s kubectl get nodes -o wide 2>/dev/null | tee -a /var/log/k3s-bootstrap.log || true
+      elif [[ "$ROLE" == "agent" ]]; then
+          if ! systemctl is-active --quiet k3s-agent.service 2>/dev/null; then
+              log "k3s agent not running, restarting..."
+              systemctl restart k3s-agent.service || true
+          fi
+      fi
+
+      if command -v crictl &>/dev/null; then
+          crictl rmi --prune 2>/dev/null || true
+      fi
+
+      log "Every-boot tasks complete."
+      KEOF
+    - chmod 755 /target/opt/k3s-bootstrap/every-boot.sh
+
+    # ── k3s-first-boot.service ──────────────────────────────────────
+    # No ConditionPathExists for .nvme-clone-done (x86 doesn't clone)
+    - |
+      cat > /target/etc/systemd/system/k3s-first-boot.service <<'KEOF'
+      [Unit]
+      Description=K3s first-boot cluster setup
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/opt/k3s-bootstrap/.first-boot-pending
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/first-boot.sh
+      ExecStartPost=/bin/rm -f /opt/k3s-bootstrap/.first-boot-pending
+      RemainAfterExit=true
+      TimeoutStartSec=600
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+      KEOF
+
+    # ── k3s-every-boot.service ──────────────────────────────────────
+    - |
+      cat > /target/etc/systemd/system/k3s-every-boot.service <<'KEOF'
+      [Unit]
+      Description=K3s every-boot maintenance
+      After=network-online.target k3s.service k3s-agent.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/every-boot.sh
+      RemainAfterExit=true
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+      KEOF
+
+    # ── Enable services + create sentinel ───────────────────────────
+    - curtin in-target -- systemctl enable k3s-first-boot.service
+    - curtin in-target -- systemctl enable k3s-every-boot.service
+    - touch /target/opt/k3s-bootstrap/.first-boot-pending
+
+  # Power off after install — user removes USB, powers on
+  shutdown: poweroff

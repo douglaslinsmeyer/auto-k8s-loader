@@ -1,131 +1,123 @@
 #!/usr/bin/env bash
-# ── prepare-usb.sh ──────────────────────────────────────────────────
-# Prepares a USB/eSATA drive as a DUAL-ARCH unattended Ubuntu 24.04
-# autoinstaller for k3s cluster nodes.
+# ── prepare-usb.sh ──────────────────────────────────────────────────────
+# Creates a dual-arch (x86_64 + Pi 5) unattended k3s installer drive.
+# Runs on Linux (e.g. SSH into a Pi node in your cluster).
 #
-# Supports:
-#   - x86_64 (Intel/AMD) PCs  → standard Ubuntu autoinstall
-#   - ARM64  (Raspberry Pi 5)  → preinstalled image cloned to NVMe
+# Partition layout:
+#   Part 1:  1 GB    FAT32  ESP — GRUB EFI for x86 UEFI boot
+#   Part 2:  6 GB    ext4   x86 Ubuntu installer (ISO contents + autoinstall)
+#   Part 3:  300 MB  FAT32  Pi boot (firmware, kernel, config.txt, cloud-init)
+#   Part 4:  4 GB    ext4   Pi root filesystem
 #
-# !! MUST BE RUN FROM LINUX !!
-# (ext4 partition creation is required; macOS cannot do this)
+# Boot paths:
+#   x86 UEFI → ESP (Part 1) → GRUB → installer on Part 2 → autoinstall → poweroff
+#   Pi 5     → scans FAT32 → finds config.txt on Part 3 → boots Part 3+4 →
+#              cloud-init → clones to NVMe → poweroff
 #
-# If you don't have a Linux machine yet, boot any PC from a Ubuntu
-# live USB and run this script from there.
+# All k3s scripts are embedded inside user-data-x86 and user-data-pi.
+# No standalone script files are needed.
 #
 # Usage:  sudo ./prepare-usb.sh /dev/sdX
-#
-# Prerequisites:
-#   apt install -y parted dosfstools e2fsprogs grub-efi-amd64-bin \
-#                  xorriso rsync curl qemu-utils xz-utils
 set -euo pipefail
 
-# ── Colors ──────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-info() { echo -e "${CYAN}[i]${NC} $*"; }
 die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
-# ── Platform check ──────────────────────────────────────────────────
-[[ "$(uname)" != "Linux" ]] && die "This script must be run from Linux (ext4 partitions required). Boot a Ubuntu live USB if needed."
-[[ $EUID -ne 0 ]] && die "Must be run as root (sudo)."
-
-# ── Validate args ───────────────────────────────────────────────────
-if [[ $# -lt 1 ]]; then
-    echo "Usage: sudo $0 /dev/sdX"
-    echo ""
-    echo "Run 'lsblk -o NAME,SIZE,TYPE,TRAN,MODEL' to find your USB drive."
-    exit 1
-fi
+# ── Validate ────────────────────────────────────────────────────────────
+[[ "$(uname)" != "Linux" ]] && die "This script must be run from Linux."
+[[ $EUID -ne 0 ]] && die "Must run as root (sudo)."
+[[ $# -lt 1 ]] && { echo "Usage: sudo $0 /dev/sdX"; echo "Run 'lsblk' to find your USB/eSATA drive."; exit 1; }
 
 DEVICE="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Safety: refuse to operate on the root disk
-ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's/[0-9]*$//' | sed 's/p[0-9]*$//')
-[[ "$DEVICE" == "$ROOT_DEV"* ]] && die "Refusing to operate on root disk $ROOT_DEV"
-
-# Verify device exists and is a block device
 [[ ! -b "$DEVICE" ]] && die "$DEVICE is not a block device."
 
-# ── URLs & Files ────────────────────────────────────────────────────
-X86_ISO_URL="https://releases.ubuntu.com/24.04/ubuntu-24.04.2-live-server-amd64.iso"
-PI_IMG_URL="https://cdimage.ubuntu.com/releases/24.04/release/ubuntu-24.04.2-preinstalled-server-arm64+raspi.img.xz"
+# Safety: refuse the boot disk
+ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's/[0-9]*$//' | sed 's/p[0-9]*$//')
+[[ "$DEVICE" == "$ROOT_DEV"* ]] && die "Refusing to operate on boot disk ($ROOT_DEV)."
+
+# ── Required files ──────────────────────────────────────────────────────
+USER_DATA_X86="${SCRIPT_DIR}/user-data-x86"
+USER_DATA_PI="${SCRIPT_DIR}/user-data-pi"
+[[ ! -f "$USER_DATA_X86" ]] && die "user-data-x86 not found in ${SCRIPT_DIR}"
+[[ ! -f "$USER_DATA_PI" ]]  && die "user-data-pi not found in ${SCRIPT_DIR}"
+
+# ── Config ──────────────────────────────────────────────────────────────
+X86_ISO_URL="https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-live-server-amd64.iso"
+PI_IMG_URL="https://cdimage.ubuntu.com/releases/24.04.4/release/ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz"
 
 X86_ISO="${SCRIPT_DIR}/ubuntu-24.04-server-amd64.iso"
-PI_IMG_XZ="${SCRIPT_DIR}/ubuntu-24.04-server-arm64-raspi.img.xz"
-PI_IMG="${SCRIPT_DIR}/ubuntu-24.04-server-arm64-raspi.img"
+PI_IMG_XZ="${SCRIPT_DIR}/ubuntu-24.04-pi-arm64.img.xz"
+PI_IMG="${SCRIPT_DIR}/ubuntu-24.04-pi-arm64.img"
 
+# ── Cleanup trap ────────────────────────────────────────────────────────
 WORK_DIR=$(mktemp -d /tmp/k3s-usb.XXXXXX)
-trap 'cleanup' EXIT
-
 cleanup() {
-    log "Cleaning up..."
-    # Unmount everything we might have mounted
+    log "Cleaning up mounts..."
     for mp in "${WORK_DIR}"/*/; do
         mountpoint -q "$mp" 2>/dev/null && umount -l "$mp" 2>/dev/null || true
     done
-    # Detach any loop devices we set up
-    losetup -j "$PI_IMG" 2>/dev/null | cut -d: -f1 | while read -r lo; do
-        losetup -d "$lo" 2>/dev/null || true
-    done
+    [[ -n "${PI_LOOP:-}" ]] && losetup -d "$PI_LOOP" 2>/dev/null || true
     rm -rf "$WORK_DIR"
 }
+trap cleanup EXIT
 
-# ── Helper: partition device path ───────────────────────────────────
-# /dev/sda  → /dev/sda1
-# /dev/nvme0n1 → /dev/nvme0n1p1
-part_path() {
+# ── Helper: partition device path ─────────────────────────────────────
+# /dev/sda → /dev/sda1   |   /dev/nvme0n1 → /dev/nvme0n1p1
+part() {
     local dev="$1" num="$2"
-    if [[ "$dev" =~ [0-9]$ ]]; then
-        echo "${dev}p${num}"
-    else
-        echo "${dev}${num}"
-    fi
+    if [[ "$dev" =~ [0-9]$ ]]; then echo "${dev}p${num}"; else echo "${dev}${num}"; fi
 }
 
-# ══════════════════════════════════════════════════════════════════════
+# ── Install dependencies ────────────────────────────────────────────────
+log "Checking dependencies..."
+for pkg in parted dosfstools e2fsprogs rsync curl xz-utils; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+        log "Installing $pkg..."
+        apt-get update -qq && apt-get install -y -qq "$pkg" || warn "Could not install $pkg"
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════════
 #  STEP 1: Download images
-# ══════════════════════════════════════════════════════════════════════
-log "Step 1/7: Downloading images..."
+# ═════════════════════════════════════════════════════════════════════════
+log "Step 1/6: Downloading images..."
 
 if [[ -f "$X86_ISO" ]]; then
-    info "Found existing x86_64 ISO"
+    log "Found existing x86 ISO: $(basename "$X86_ISO")"
 else
-    log "Downloading Ubuntu 24.04 Server x86_64 (~2.6 GB)..."
+    log "Downloading Ubuntu 24.04 Server x86_64 ISO (~2.6 GB)..."
     curl -L -# -o "$X86_ISO" "$X86_ISO_URL" || die "x86 ISO download failed."
 fi
 
 if [[ -f "$PI_IMG" ]]; then
-    info "Found existing Pi ARM64 image (decompressed)"
+    log "Found existing Pi image (decompressed)"
 elif [[ -f "$PI_IMG_XZ" ]]; then
-    info "Found existing Pi ARM64 image (compressed), decompressing..."
+    log "Decompressing Pi image..."
     xz -dk "$PI_IMG_XZ" || die "Decompression failed."
 else
-    log "Downloading Ubuntu 24.04 Server ARM64 for Pi (~2.0 GB compressed)..."
+    log "Downloading Ubuntu 24.04 Server ARM64 for Pi (~2.0 GB)..."
     curl -L -# -o "$PI_IMG_XZ" "$PI_IMG_URL" || die "Pi image download failed."
     log "Decompressing Pi image..."
     xz -dk "$PI_IMG_XZ" || die "Decompression failed."
 fi
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 2: Partition the USB drive
-# ══════════════════════════════════════════════════════════════════════
-log ""
-log "Step 2/7: Partitioning ${DEVICE}"
+# ═════════════════════════════════════════════════════════════════════════
+#  STEP 2: Partition the drive
+# ═════════════════════════════════════════════════════════════════════════
 log ""
 log "═══════════════════════════════════════════════════════════════"
-log "  Target:  ${DEVICE}"
-log "  Size:    $(lsblk -dno SIZE "$DEVICE" 2>/dev/null || echo 'unknown')"
-log "  Model:   $(lsblk -dno MODEL "$DEVICE" 2>/dev/null || echo 'unknown')"
+log "  Target: ${DEVICE}"
+lsblk "$DEVICE" 2>/dev/null || true
 log ""
-log "  Partition layout:"
-log "    Part 1:  1 GB   FAT32  EFI System (GRUB x86 + Pi firmware)"
-log "    Part 2:  6 GB   ext4   x86_64 Ubuntu installer"
-log "    Part 3:  300 MB FAT32  Pi boot (system-boot)"
-log "    Part 4:  6 GB   ext4   Pi root filesystem"
-log "    (rest of drive unused / free)"
+log "  Layout:"
+log "    Part 1:  1 GB    FAT32  ESP (GRUB for x86 UEFI)"
+log "    Part 2:  6 GB    ext4   x86 Ubuntu installer + autoinstall"
+log "    Part 3:  300 MB  FAT32  Pi boot (firmware + cloud-init)"
+log "    Part 4:  4 GB    ext4   Pi root filesystem"
 log ""
 log "  ALL DATA ON THIS DEVICE WILL BE DESTROYED."
 log "═══════════════════════════════════════════════════════════════"
@@ -133,53 +125,46 @@ log ""
 read -rp "Type 'YES' to continue: " CONFIRM
 [[ "$CONFIRM" != "YES" ]] && die "Aborted."
 
-# Unmount all partitions
-umount "${DEVICE}"* 2>/dev/null || true
-umount "$(part_path "$DEVICE" 1)" 2>/dev/null || true
-umount "$(part_path "$DEVICE" 2)" 2>/dev/null || true
-umount "$(part_path "$DEVICE" 3)" 2>/dev/null || true
-umount "$(part_path "$DEVICE" 4)" 2>/dev/null || true
+log "Step 2/6: Partitioning ${DEVICE}..."
 
-# Wipe and create GPT
+# Unmount any existing partitions
+for i in 1 2 3 4 5 6 7 8; do
+    umount "$(part "$DEVICE" "$i")" 2>/dev/null || true
+done
+
 wipefs -af "$DEVICE" >/dev/null 2>&1
-sgdisk --zap-all "$DEVICE" >/dev/null 2>&1 || true
 parted -s "$DEVICE" mklabel gpt
 
-# Create partitions
-# Part 1: ESP (FAT32, 1GB) — holds GRUB EFI for x86 + Pi firmware + shared configs
-parted -s "$DEVICE" mkpart "ESP" fat32 1MiB 1025MiB
+parted -s "$DEVICE" mkpart "ESP"          fat32 1MiB    1025MiB
 parted -s "$DEVICE" set 1 esp on
 parted -s "$DEVICE" set 1 boot on
+parted -s "$DEVICE" mkpart "x86-install"  ext4  1025MiB 7169MiB
+parted -s "$DEVICE" mkpart "pi-boot"      fat32 7169MiB 7469MiB
+parted -s "$DEVICE" mkpart "pi-root"      ext4  7469MiB 11569MiB
 
-# Part 2: x86 installer (ext4, 6GB) — Ubuntu ISO contents + autoinstall
-parted -s "$DEVICE" mkpart "x86-installer" ext4 1025MiB 7169MiB
-
-# Part 3: Pi boot (FAT32, 300MB) — Pi firmware, kernel, config.txt
-parted -s "$DEVICE" mkpart "pi-boot" fat32 7169MiB 7469MiB
-
-# Part 4: Pi root (ext4, 6GB) — Ubuntu ARM64 root filesystem
-parted -s "$DEVICE" mkpart "pi-root" ext4 7469MiB 13613MiB
-
-# Let kernel re-read partition table
+sleep 2
 partprobe "$DEVICE" 2>/dev/null || true
 sleep 2
 
-P1=$(part_path "$DEVICE" 1)
-P2=$(part_path "$DEVICE" 2)
-P3=$(part_path "$DEVICE" 3)
-P4=$(part_path "$DEVICE" 4)
+P1=$(part "$DEVICE" 1)
+P2=$(part "$DEVICE" 2)
+P3=$(part "$DEVICE" 3)
+P4=$(part "$DEVICE" 4)
 
-# Format partitions
-log "Formatting partitions..."
-mkfs.fat -F 32 -n "K3S_EFI" "$P1"
-mkfs.ext4 -F -L "K3S_X86" "$P2"
-mkfs.fat -F 32 -n "K3S_PIBOOT" "$P3"
-mkfs.ext4 -F -L "K3S_PIROOT" "$P4"
+for p in "$P1" "$P2" "$P3" "$P4"; do
+    [[ ! -b "$p" ]] && die "Partition $p not found after partitioning."
+done
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 3: Set up x86_64 installer (Part 1 ESP + Part 2 data)
-# ══════════════════════════════════════════════════════════════════════
-log "Step 3/7: Setting up x86_64 installer..."
+log "Formatting..."
+mkfs.fat  -F 32 -n "K3S_EFI"    "$P1"
+mkfs.ext4 -F    -L "K3S_X86"    "$P2"
+mkfs.fat  -F 32 -n "K3S_PIBOOT" "$P3"
+mkfs.ext4 -F    -L "K3S_PIROOT" "$P4"
+
+# ═════════════════════════════════════════════════════════════════════════
+#  STEP 3: Set up x86 installer (ESP + Part 2)
+# ═════════════════════════════════════════════════════════════════════════
+log "Step 3/6: Setting up x86 installer..."
 
 MNT_ESP="${WORK_DIR}/esp"
 MNT_X86="${WORK_DIR}/x86"
@@ -188,43 +173,27 @@ mkdir -p "$MNT_ESP" "$MNT_X86" "$MNT_ISO"
 
 mount "$P1" "$MNT_ESP"
 mount "$P2" "$MNT_X86"
-mount -o loop,ro "$X86_ISO" "$MNT_ISO"
+mount -o loop,ro "$X86_ISO" "$MNT_ISO" || die "Could not mount ISO."
 
-# Copy ISO contents to x86 partition
-log "  Copying x86_64 installer files (~2.5 GB)..."
+# Copy ISO contents to x86 installer partition
+log "  Copying x86 ISO contents to Part 2 (~2.5 GB)..."
 rsync -a --info=progress2 "$MNT_ISO/" "$MNT_X86/"
 
-# Copy autoinstall configs to x86 partition
-mkdir -p "${MNT_X86}/autoinstall"
-cp "${SCRIPT_DIR}/user-data"  "${MNT_X86}/autoinstall/user-data"
-cp "${SCRIPT_DIR}/meta-data"  "${MNT_X86}/autoinstall/meta-data"
-mkdir -p "${MNT_X86}/nocloud"
-cp "${SCRIPT_DIR}/user-data"  "${MNT_X86}/nocloud/user-data"
-cp "${SCRIPT_DIR}/meta-data"  "${MNT_X86}/nocloud/meta-data"
-
-# Copy k3s scripts to x86 partition (installer's late-commands read from here)
-mkdir -p "${MNT_X86}/k3s-scripts"
-cp "${SCRIPT_DIR}/first-boot.sh"   "${MNT_X86}/k3s-scripts/first-boot.sh"
-cp "${SCRIPT_DIR}/every-boot.sh"   "${MNT_X86}/k3s-scripts/every-boot.sh"
-cp "${SCRIPT_DIR}/k3s-config.env"  "${MNT_X86}/k3s-scripts/k3s-config.env"
-
 # Set up GRUB on ESP
-log "  Installing GRUB EFI bootloader..."
+log "  Setting up GRUB on ESP..."
 mkdir -p "${MNT_ESP}/EFI/BOOT"
 
 # Copy GRUB EFI binary from ISO
 if [[ -f "${MNT_ISO}/EFI/BOOT/BOOTx64.EFI" ]]; then
     cp "${MNT_ISO}/EFI/BOOT/BOOTx64.EFI" "${MNT_ESP}/EFI/BOOT/BOOTX64.EFI"
-    cp "${MNT_ISO}/EFI/BOOT/grubx64.efi"  "${MNT_ESP}/EFI/BOOT/grubx64.efi" 2>/dev/null || true
 elif [[ -f "${MNT_ISO}/EFI/BOOT/BOOTX64.EFI" ]]; then
     cp "${MNT_ISO}/EFI/BOOT/BOOTX64.EFI" "${MNT_ESP}/EFI/BOOT/BOOTX64.EFI"
-    cp "${MNT_ISO}/EFI/BOOT/grubx64.efi"  "${MNT_ESP}/EFI/BOOT/grubx64.efi" 2>/dev/null || true
 else
-    # Fallback: use grub-install
-    grub-install --target=x86_64-efi --efi-directory="$MNT_ESP" \
-        --boot-directory="${MNT_ESP}/boot" --removable --no-nvram 2>/dev/null || \
-        warn "GRUB EFI install failed — x86 UEFI boot may not work"
+    warn "No BOOTX64.EFI found in ISO — x86 UEFI boot may not work."
+    warn "You may need to copy BOOTX64.EFI to the ESP manually."
 fi
+# Copy grubx64.efi too (some UEFI implementations look for this)
+cp "${MNT_ISO}/EFI/BOOT/grubx64.efi" "${MNT_ESP}/EFI/BOOT/grubx64.efi" 2>/dev/null || true
 
 # Copy GRUB modules from ISO
 if [[ -d "${MNT_ISO}/boot/grub" ]]; then
@@ -232,10 +201,13 @@ if [[ -d "${MNT_ISO}/boot/grub" ]]; then
     rsync -a "${MNT_ISO}/boot/grub/" "${MNT_ESP}/boot/grub/" 2>/dev/null || true
 fi
 
-# Get the UUID of partition 2 (x86 installer)
+umount "$MNT_ISO"
+
+# Get x86 installer partition UUID for GRUB
 X86_UUID=$(blkid -s UUID -o value "$P2")
 
-# Write GRUB config that boots the Ubuntu installer from partition 2
+# Write GRUB config
+mkdir -p "${MNT_ESP}/boot/grub"
 cat > "${MNT_ESP}/boot/grub/grub.cfg" <<GRUBCFG
 set default=0
 set timeout=3
@@ -243,243 +215,118 @@ set timeout=3
 menuentry "Install Ubuntu 24.04 (x86_64) - K3s Autoinstall" {
     search --no-floppy --fs-uuid --set=root ${X86_UUID}
     set gfxpayload=keep
-    linux /casper/vmlinuz quiet autoinstall ds=nocloud\;s=/cdrom/autoinstall/ ---
+    linux /casper/vmlinuz quiet autoinstall ds=nocloud\\;s=/cdrom/ ---
     initrd /casper/initrd
 }
 
-menuentry "Install Ubuntu 24.04 (x86_64) - Interactive" {
+menuentry "Install Ubuntu 24.04 - Safe Graphics" {
     search --no-floppy --fs-uuid --set=root ${X86_UUID}
     set gfxpayload=keep
-    linux /casper/vmlinuz ---
+    linux /casper/vmlinuz quiet autoinstall ds=nocloud\\;s=/cdrom/ nomodeset ---
     initrd /casper/initrd
 }
 GRUBCFG
 
-# Also make autoinstall configs accessible from the standard /cdrom path
-# The Ubuntu installer mounts the boot source at /cdrom
-mkdir -p "${MNT_X86}/cdrom"
-ln -sf ../autoinstall "${MNT_X86}/cdrom/autoinstall" 2>/dev/null || \
-    cp -r "${MNT_X86}/autoinstall" "${MNT_X86}/cdrom/autoinstall" 2>/dev/null || true
+# Also put grub.cfg where GRUB EFI might look for it
+cp "${MNT_ESP}/boot/grub/grub.cfg" "${MNT_ESP}/EFI/BOOT/grub.cfg"
 
-umount "$MNT_ISO"
+# Inject autoinstall user-data into the x86 installer partition
+# Ubuntu autoinstall with ds=nocloud;s=/cdrom/ looks at the root of the boot source
+log "  Injecting x86 autoinstall user-data..."
+cp "$USER_DATA_X86" "${MNT_X86}/user-data"
+touch "${MNT_X86}/meta-data"
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 4: Set up Pi 5 installer (Part 3 boot + Part 4 root)
-# ══════════════════════════════════════════════════════════════════════
-log "Step 4/7: Setting up Pi 5 ARM64 installer..."
+# ═════════════════════════════════════════════════════════════════════════
+#  STEP 4: Set up Pi boot + root (Parts 3 + 4)
+# ═════════════════════════════════════════════════════════════════════════
+log "Step 4/6: Setting up Pi partitions from ARM64 image..."
 
 MNT_PIBOOT="${WORK_DIR}/pi-boot"
 MNT_PIROOT="${WORK_DIR}/pi-root"
-MNT_PIIMG_BOOT="${WORK_DIR}/piimg-boot"
-MNT_PIIMG_ROOT="${WORK_DIR}/piimg-root"
-mkdir -p "$MNT_PIBOOT" "$MNT_PIROOT" "$MNT_PIIMG_BOOT" "$MNT_PIIMG_ROOT"
+MNT_IMG_BOOT="${WORK_DIR}/img-boot"
+MNT_IMG_ROOT="${WORK_DIR}/img-root"
+mkdir -p "$MNT_PIBOOT" "$MNT_PIROOT" "$MNT_IMG_BOOT" "$MNT_IMG_ROOT"
 
 mount "$P3" "$MNT_PIBOOT"
 mount "$P4" "$MNT_PIROOT"
 
-# Mount the Pi image's two partitions via loop device
-LOOP_DEV=$(losetup --find --show --partscan "$PI_IMG")
-sleep 1
+# Mount Pi image partitions via loop device
+PI_LOOP=$(losetup -fP --show "$PI_IMG") || die "Could not set up loop device for Pi image."
+sleep 2
 
-# Pi image layout: partition 1 = FAT32 boot, partition 2 = ext4 root
-PIIMG_P1="${LOOP_DEV}p1"
-PIIMG_P2="${LOOP_DEV}p2"
+mount "${PI_LOOP}p1" "$MNT_IMG_BOOT" || die "Could not mount Pi image boot partition."
+mount "${PI_LOOP}p2" "$MNT_IMG_ROOT" || die "Could not mount Pi image root partition."
 
-if [[ ! -b "$PIIMG_P1" ]] || [[ ! -b "$PIIMG_P2" ]]; then
-    # Fallback: calculate offsets manually
-    BOOT_OFFSET=$(fdisk -l "$PI_IMG" | awk '/^.*img1/{print $2 * 512}')
-    ROOT_OFFSET=$(fdisk -l "$PI_IMG" | awk '/^.*img2/{print $2 * 512}')
-    losetup -d "$LOOP_DEV" 2>/dev/null
-    LOOP_BOOT=$(losetup --find --show --offset "$BOOT_OFFSET" "$PI_IMG")
-    LOOP_ROOT=$(losetup --find --show --offset "$ROOT_OFFSET" "$PI_IMG")
-    mount "$LOOP_BOOT" "$MNT_PIIMG_BOOT"
-    mount "$LOOP_ROOT" "$MNT_PIIMG_ROOT"
-else
-    mount "$PIIMG_P1" "$MNT_PIIMG_BOOT"
-    mount "$PIIMG_P2" "$MNT_PIIMG_ROOT"
-fi
-
-# Copy Pi boot files
 log "  Copying Pi boot partition..."
-rsync -a "$MNT_PIIMG_BOOT/" "$MNT_PIBOOT/"
+rsync -a "$MNT_IMG_BOOT/" "$MNT_PIBOOT/"
 
-# Copy Pi root filesystem
-log "  Copying Pi root filesystem (~3-4 GB, this takes a few minutes)..."
-rsync -a --info=progress2 "$MNT_PIIMG_ROOT/" "$MNT_PIROOT/"
+log "  Copying Pi root filesystem (this takes several minutes)..."
+rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/"
 
-# Unmount Pi image
-umount "$MNT_PIIMG_BOOT" 2>/dev/null || true
-umount "$MNT_PIIMG_ROOT" 2>/dev/null || true
-losetup -D 2>/dev/null || true
+umount "$MNT_IMG_BOOT"
+umount "$MNT_IMG_ROOT"
+losetup -d "$PI_LOOP"
+PI_LOOP=""
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 5: Configure Pi boot to use our partitions
-# ══════════════════════════════════════════════════════════════════════
-log "Step 5/7: Configuring Pi 5 boot..."
+# ═════════════════════════════════════════════════════════════════════════
+#  STEP 5: Configure Pi boot + inject cloud-init
+# ═════════════════════════════════════════════════════════════════════════
+log "Step 5/6: Configuring Pi boot and injecting cloud-init..."
 
-PI_ROOT_UUID=$(blkid -s UUID -o value "$P4")
-PI_ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$P4")
-
-# Update cmdline.txt to point root= at our partition 4
-if [[ -f "${MNT_PIBOOT}/cmdline.txt" ]]; then
-    # Replace the root= parameter with our partition's UUID
-    sed -i "s|root=[^ ]*|root=UUID=${PI_ROOT_UUID}|" "${MNT_PIBOOT}/cmdline.txt"
-    # If PARTUUID was used instead
-    sed -i "s|root=PARTUUID=[^ ]*|root=UUID=${PI_ROOT_UUID}|" "${MNT_PIBOOT}/cmdline.txt"
-fi
-
-# Update fstab in Pi root to match our partition UUIDs
 PI_BOOT_UUID=$(blkid -s UUID -o value "$P3")
-if [[ -f "${MNT_PIROOT}/etc/fstab" ]]; then
-    # Rewrite fstab with our UUIDs
-    cat > "${MNT_PIROOT}/etc/fstab" <<FSTAB
-# /etc/fstab — generated by k3s-autoinstaller
-UUID=${PI_ROOT_UUID}  /       ext4  defaults,noatime  0  1
-UUID=${PI_BOOT_UUID}  /boot/firmware  vfat  defaults  0  2
-FSTAB
-fi
+PI_ROOT_UUID=$(blkid -s UUID -o value "$P4")
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 6: Inject k3s scripts + cloud-init into Pi filesystem
-# ══════════════════════════════════════════════════════════════════════
-log "Step 6/7: Injecting k3s bootstrap into Pi filesystem..."
-
-# Copy k3s scripts
-mkdir -p "${MNT_PIROOT}/opt/k3s-bootstrap"
-cp "${SCRIPT_DIR}/first-boot.sh"   "${MNT_PIROOT}/opt/k3s-bootstrap/first-boot.sh"
-cp "${SCRIPT_DIR}/every-boot.sh"   "${MNT_PIROOT}/opt/k3s-bootstrap/every-boot.sh"
-cp "${SCRIPT_DIR}/k3s-config.env"  "${MNT_PIROOT}/opt/k3s-bootstrap/k3s-config.env"
-cp "${SCRIPT_DIR}/pi-clone-to-nvme.sh" "${MNT_PIROOT}/opt/k3s-bootstrap/pi-clone-to-nvme.sh"
-chmod +x "${MNT_PIROOT}/opt/k3s-bootstrap/"*.sh
-
-# Create the first-boot sentinel
-touch "${MNT_PIROOT}/opt/k3s-bootstrap/.first-boot-pending"
-
-# Create systemd services (same as x86, but written directly)
-cat > "${MNT_PIROOT}/etc/systemd/system/k3s-first-boot.service" <<'UNIT'
-[Unit]
-Description=K3s first-boot cluster setup
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/opt/k3s-bootstrap/.first-boot-pending
-
-[Service]
-Type=oneshot
-ExecStart=/opt/k3s-bootstrap/first-boot.sh
-ExecStartPost=/bin/rm -f /opt/k3s-bootstrap/.first-boot-pending
-RemainAfterExit=true
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-cat > "${MNT_PIROOT}/etc/systemd/system/k3s-every-boot.service" <<'UNIT'
-[Unit]
-Description=K3s every-boot maintenance
-After=network-online.target k3s-first-boot.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/opt/k3s-bootstrap/every-boot.sh
-RemainAfterExit=true
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# Enable services via symlinks (chroot not available for arm64 on x86)
-mkdir -p "${MNT_PIROOT}/etc/systemd/system/multi-user.target.wants"
-ln -sf /etc/systemd/system/k3s-first-boot.service \
-    "${MNT_PIROOT}/etc/systemd/system/multi-user.target.wants/k3s-first-boot.service"
-ln -sf /etc/systemd/system/k3s-every-boot.service \
-    "${MNT_PIROOT}/etc/systemd/system/multi-user.target.wants/k3s-every-boot.service"
-
-# ── Pi clone-to-NVMe service (runs BEFORE k3s first boot) ──────────
-# This detects if booted from USB, clones to NVMe, then powers off.
-cat > "${MNT_PIROOT}/etc/systemd/system/pi-clone-to-nvme.service" <<'UNIT'
-[Unit]
-Description=Clone Pi system from USB to NVMe
-After=network-online.target
-Wants=network-online.target
-Before=k3s-first-boot.service
-ConditionPathExists=/opt/k3s-bootstrap/pi-clone-to-nvme.sh
-# Only run if booted from USB (not NVMe)
-ConditionPathExists=!/opt/k3s-bootstrap/.nvme-clone-done
-
-[Service]
-Type=oneshot
-ExecStart=/opt/k3s-bootstrap/pi-clone-to-nvme.sh
-RemainAfterExit=true
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-ln -sf /etc/systemd/system/pi-clone-to-nvme.service \
-    "${MNT_PIROOT}/etc/systemd/system/multi-user.target.wants/pi-clone-to-nvme.service"
-
-# ── Cloud-init: set up user, SSH, packages ──────────────────────────
-# The Pi preinstalled image uses cloud-init for first-boot user setup
-mkdir -p "${MNT_PIBOOT}/nocloud"
-cp "${SCRIPT_DIR}/user-data-pi" "${MNT_PIBOOT}/nocloud/user-data"
-cp "${SCRIPT_DIR}/meta-data"    "${MNT_PIBOOT}/nocloud/meta-data"
-
-# Also place in the standard cloud-init location
-mkdir -p "${MNT_PIROOT}/var/lib/cloud/seed/nocloud"
-cp "${SCRIPT_DIR}/user-data-pi" "${MNT_PIROOT}/var/lib/cloud/seed/nocloud/user-data"
-cp "${SCRIPT_DIR}/meta-data"    "${MNT_PIROOT}/var/lib/cloud/seed/nocloud/meta-data"
-
-# Tell cloud-init where to find the datasource
+# Update cmdline.txt to point to our root partition
 if [[ -f "${MNT_PIBOOT}/cmdline.txt" ]]; then
-    # Append ds=nocloud if not already present
-    if ! grep -q "ds=nocloud" "${MNT_PIBOOT}/cmdline.txt"; then
-        sed -i 's/$/ ds=nocloud/' "${MNT_PIBOOT}/cmdline.txt"
-    fi
+    sed -i "s|root=[^ ]*|root=UUID=${PI_ROOT_UUID}|" "${MNT_PIBOOT}/cmdline.txt"
+    sed -i "s|root=PARTUUID=[^ ]*|root=UUID=${PI_ROOT_UUID}|" "${MNT_PIBOOT}/cmdline.txt"
+    log "  Updated cmdline.txt → root=UUID=${PI_ROOT_UUID}"
 fi
 
-# ══════════════════════════════════════════════════════════════════════
-#  STEP 7: Finalize
-# ══════════════════════════════════════════════════════════════════════
-log "Step 7/7: Syncing and finalizing..."
+# Update fstab on Pi root
+cat > "${MNT_PIROOT}/etc/fstab" <<FSTAB
+# Generated by prepare-usb.sh for USB boot
+UUID=${PI_ROOT_UUID}  /               ext4  defaults,noatime  0  1
+UUID=${PI_BOOT_UUID}  /boot/firmware  vfat  defaults          0  2
+FSTAB
 
-# Also copy k3s scripts to ESP for easy access/editing
-mkdir -p "${MNT_ESP}/k3s-scripts"
-cp "${SCRIPT_DIR}/first-boot.sh"   "${MNT_ESP}/k3s-scripts/"
-cp "${SCRIPT_DIR}/every-boot.sh"   "${MNT_ESP}/k3s-scripts/"
-cp "${SCRIPT_DIR}/k3s-config.env"  "${MNT_ESP}/k3s-scripts/"
-cp "${SCRIPT_DIR}/pi-clone-to-nvme.sh" "${MNT_ESP}/k3s-scripts/"
+# Inject cloud-init user-data onto the Pi boot partition
+# The Pi's Ubuntu image reads cloud-init from the boot partition root
+cp "$USER_DATA_PI" "${MNT_PIBOOT}/user-data"
+touch "${MNT_PIBOOT}/meta-data"
+
+log "  Pi cloud-init user-data injected"
+
+# ═════════════════════════════════════════════════════════════════════════
+#  STEP 6: Sync and finalize
+# ═════════════════════════════════════════════════════════════════════════
+log "Step 6/6: Syncing and finalizing..."
 
 sync
-
-# Unmount everything
+umount "$MNT_ESP"    2>/dev/null || true
+umount "$MNT_X86"    2>/dev/null || true
 umount "$MNT_PIBOOT" 2>/dev/null || true
 umount "$MNT_PIROOT" 2>/dev/null || true
-umount "$MNT_X86"    2>/dev/null || true
-umount "$MNT_ESP"    2>/dev/null || true
 sync
 
 log ""
 log "═══════════════════════════════════════════════════════════════"
-log "  USB drive is ready!  (dual-arch: x86_64 + ARM64 Pi 5)"
+log "  Dual-arch USB drive is ready!"
 log ""
-log "  x86_64 machines:"
-log "    1. Plug USB in, boot from USB (UEFI)"
-log "    2. Select 'Install Ubuntu 24.04 - K3s Autoinstall'"
-log "    3. Ubuntu installs → machine powers off"
-log "    4. Remove USB, power on → k3s bootstraps"
+lsblk "$DEVICE" 2>/dev/null || true
 log ""
-log "  Raspberry Pi 5 (with NVMe):"
-log "    1. Plug USB in, power on (Pi boots from USB)"
-log "    2. System clones itself to NVMe → Pi powers off"
-log "    3. Remove USB, power on → boots from NVMe, k3s bootstraps"
+log "  x86_64 deployment:"
+log "    1. Plug USB into x86 machine, boot from USB (UEFI)"
+log "    2. GRUB auto-selects K3s Autoinstall after 3 seconds"
+log "    3. Ubuntu installs unattended (~10-15 min), machine powers off"
+log "    4. Remove USB, power on → k3s bootstraps on first boot"
 log ""
-log "  First node  → k3s server (advertises via mDNS)"
-log "  Next nodes  → auto-discover and join as agents"
+log "  Raspberry Pi 5 deployment:"
+log "    1. Plug USB into Pi 5, power on"
+log "    2. Pi boots from USB, clones to NVMe (~5-10 min), powers off"
+log "    3. Remove USB, power on → k3s bootstraps on first boot"
+log ""
+log "  Cluster auto-discovery:"
+log "    First node (any arch) → k3s server (publishes via mDNS)"
+log "    All subsequent nodes  → auto-discover and join as agents"
 log "═══════════════════════════════════════════════════════════════"
