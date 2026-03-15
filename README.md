@@ -1,96 +1,66 @@
-# K3s Auto-Installer USB (Dual-Arch)
+# K3s Auto-Installer USB — Raspberry Pi 5
 
-One USB drive that auto-installs Ubuntu 24.04 + k3s on both x86_64 PCs and Raspberry Pi 5 (with NVMe). First node creates the cluster; subsequent nodes auto-join via mDNS.
+One USB/eSATA drive that auto-installs Ubuntu 24.04 + k3s on Raspberry Pi 5 with NVMe. Plug in, power on, walk away. First node creates the cluster; subsequent nodes auto-join via mDNS.
 
-## Architecture Support
+## How It Works
 
-| Target | Boot method | Install target | How it works |
-|---|---|---|---|
-| x86_64 (Intel/AMD) | UEFI boot from USB | Internal disk (SSD/HDD) | Ubuntu autoinstall → poweroff → remove USB → k3s on first boot |
-| Raspberry Pi 5 | Pi bootloader from USB | NVMe (via M.2 HAT) | Boots Ubuntu from USB → clones to NVMe → poweroff → remove USB → k3s on first boot |
+1. Pi 5 boots Ubuntu from USB
+2. Cloud-init sets up user, SSH, packages
+3. `pi-clone-to-nvme.sh` clones the entire system to the NVMe SSD
+4. Pi powers off — you remove the USB
+5. Pi boots from NVMe, `first-boot.sh` installs k3s (server or agent)
+6. On every subsequent boot, `every-boot.sh` runs health checks
+
+## Prerequisites
+
+- Raspberry Pi 5 with NVMe SSD (via M.2 HAT)
+- Pi firmware that allows USB boot (default on recent EEPROM)
+- macOS with `xz` installed (`brew install xz`)
+
+## Quick Start
+
+### 1. Edit your cluster token
+
+Open `user-data-pi` and find the `K3S_TOKEN` line in the `k3s-config.env` section. The current token is pre-generated but you can replace it:
+
+```bash
+openssl rand -hex 32
+```
+
+All nodes must share the same token.
+
+### 2. Flash the USB drive
+
+```bash
+brew install xz    # if not already installed
+sudo bash prepare-pi-usb.sh /dev/disk4    # replace with your device
+```
+
+This downloads the Ubuntu Pi image (~2 GB compressed), writes it to the drive, and injects the cloud-init config. Takes about 5 minutes.
+
+### 3. Deploy
+
+1. Plug USB into Pi 5, power on
+2. Wait ~5-10 min (Pi boots from USB, clones to NVMe, powers off)
+3. Remove USB
+4. Power on — Pi boots from NVMe, k3s installs on first boot
+5. Plug the same USB into the next Pi and repeat
+
+### 4. Cluster auto-discovery
+
+The first Pi finds no existing k3s servers via mDNS and initialises as a server. It publishes `_k3s-server._tcp` via Avahi. Every subsequent Pi discovers this and joins as an agent.
+
+Override with the `K3S_FORCE_ROLE` setting in user-data-pi if needed.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `prepare-usb.sh` | Flashes the USB drive (**run from Linux**) |
-| `user-data` | x86_64 Ubuntu autoinstall config |
-| `user-data-pi` | Pi 5 cloud-init config |
+| `prepare-pi-usb.sh` | Flashes the USB drive (runs on macOS) |
+| `user-data-pi` | All-in-one cloud-init config with embedded scripts |
 | `meta-data` | Empty file required by cloud-init |
-| `k3s-config.env` | Cluster settings — **edit before flashing** |
-| `first-boot.sh` | Runs once: installs k3s, discovers or creates cluster |
-| `every-boot.sh` | Runs every boot: health checks, service restart, cleanup |
-| `pi-clone-to-nvme.sh` | Pi-only: clones USB system to NVMe SSD |
 
-## USB Drive Partition Layout
-
-```
-Part 1:  1 GB   FAT32  EFI System Partition (GRUB for x86 + shared configs)
-Part 2:  6 GB   ext4   x86_64 Ubuntu installer files
-Part 3:  300 MB FAT32  Pi 5 boot partition (firmware, kernel, config.txt)
-Part 4:  6 GB   ext4   Pi 5 root filesystem
-         ~240 GB        (unused / free)
-```
-
-The Pi bootloader scans for FAT32 partitions with `config.txt` — it finds Part 3. x86 UEFI scans for an ESP with `EFI/BOOT/BOOTX64.EFI` — it finds Part 1. They don't interfere.
-
-## Quick Start
-
-### 1. Edit the config
-
-```bash
-nano k3s-config.env
-```
-
-`K3S_TOKEN` is already set. Verify the other settings are what you want.
-
-### 2. Run prepare-usb.sh from Linux
-
-This script **must run from Linux** because it creates ext4 partitions. Options:
-
-- Run from an existing Ubuntu machine
-- Boot any PC from a Ubuntu live USB and run from there
-- Use a VM with USB passthrough
-
-```bash
-# Install prerequisites
-sudo apt install -y parted dosfstools e2fsprogs grub-efi-amd64-bin \
-                    xorriso rsync curl xz-utils
-
-# Flash the drive (replace /dev/sdX with your USB device)
-sudo bash prepare-usb.sh /dev/sdX
-```
-
-This downloads ~4.6 GB of images (x86 ISO + Pi ARM64 image) on the first run. They're cached locally for re-runs.
-
-### 3. Deploy to x86_64 machines
-
-1. Plug USB into target machine
-2. Boot from USB (F12/F2/Del for BIOS boot menu)
-3. Select **"Install Ubuntu 24.04 (x86_64) - K3s Autoinstall"**
-4. Ubuntu installs unattended → machine powers off
-5. Remove USB, power on → k3s bootstraps on first boot
-
-### 4. Deploy to Raspberry Pi 5
-
-Prerequisites: Pi 5 with NVMe SSD via M.2 HAT. EEPROM should allow USB boot (default on recent firmware).
-
-1. Plug USB into Pi 5
-2. Power on — Pi boots Ubuntu from USB
-3. System auto-clones itself to NVMe (~3-5 min)
-4. Pi powers off
-5. Remove USB, power on → Pi boots from NVMe, k3s bootstraps
-
-### 5. Repeat
-
-Same USB drive, next machine. Each new node discovers existing servers via mDNS and joins automatically.
-
-## Cluster Discovery
-
-- **First node** (any arch): No mDNS servers found → initialises as k3s server → advertises `_k3s-server._tcp` via Avahi
-- **Subsequent nodes**: Discover the server → join as agents
-- **Override**: Set `K3S_FORCE_ROLE=server` or `agent` in `k3s-config.env`
-- **Mixed-arch**: Works fine — k3s handles x86_64 and ARM64 nodes in the same cluster
+Everything else (first-boot.sh, every-boot.sh, pi-clone-to-nvme.sh, k3s-config.env, systemd units) is embedded inside `user-data-pi` via cloud-init's `write_files`.
 
 ## Default Credentials
 
@@ -100,55 +70,58 @@ Same USB drive, next machine. Each new node discovers existing servers via mDNS 
 | Password | `k3sadmin` |
 | SSH | Enabled (password auth) |
 
-Change for production by updating the password hash in `user-data` and `user-data-pi`.
+Change for production by updating the password hash in `user-data-pi`:
 
 ```bash
-# Generate a new password hash
 mkpasswd --method=SHA-512 yourpassword
 ```
 
-## Post-Install Access
+## Monitoring the Process
+
+Since the Pis are headless, you can monitor via SSH once the Pi gets a DHCP address:
 
 ```bash
-# SSH into a node (hostname is k3s-<mac-suffix>)
-ssh k3sadmin@k3s-XXXX.local
+# Find the Pi on your network (after it boots from USB)
+ping k3s-pi-node.local
 
-# On a server node, check cluster
-kubectl get nodes -o wide
+# SSH in
+ssh k3sadmin@k3s-pi-node.local
+
+# Watch the clone/bootstrap progress
+tail -f /var/log/k3s-bootstrap.log
+journalctl -f -u pi-clone-to-nvme.service
+journalctl -f -u k3s-first-boot.service
 ```
 
 ## Troubleshooting
 
-### x86 machines
 ```bash
-journalctl -u k3s-first-boot.service
-cat /var/log/k3s-bootstrap.log
-```
-
-### Pi 5
-```bash
-# If NVMe clone failed (still booted from USB):
+# Check NVMe clone status
 journalctl -u pi-clone-to-nvme.service
-cat /var/log/k3s-bootstrap.log
 
-# Re-run clone manually:
-sudo /opt/k3s-bootstrap/pi-clone-to-nvme.sh
-
-# If Pi doesn't boot from NVMe after clone:
-# Check EEPROM boot order:
-sudo rpi-eeprom-config
-# Set NVMe first:
-sudo rpi-eeprom-config --edit
-# Change BOOT_ORDER to: BOOT_ORDER=0xf6142
-```
-
-### General
-```bash
-# Force re-run first boot
-sudo touch /opt/k3s-bootstrap/.first-boot-pending
-sudo systemctl start k3s-first-boot.service
+# Check k3s first boot
+journalctl -u k3s-first-boot.service
 
 # Check k3s service
 journalctl -u k3s.service        # server
 journalctl -u k3s-agent.service  # agent
+
+# Full bootstrap log
+cat /var/log/k3s-bootstrap.log
+
+# Re-run first boot manually
+sudo touch /opt/k3s-bootstrap/.first-boot-pending
+sudo systemctl start k3s-first-boot.service
+
+# Re-run NVMe clone (if it failed)
+sudo rm -f /opt/k3s-bootstrap/.nvme-clone-done
+sudo systemctl start pi-clone-to-nvme.service
+
+# Check/set Pi boot order manually
+sudo rpi-eeprom-config          # view
+sudo rpi-eeprom-config --edit   # set BOOT_ORDER=0xf6142
 ```
+
+## Adding x86_64 Support Later
+
+The `prepare-usb.sh` script (also in this repo) supports a dual-arch drive with both x86 and Pi partitions. It requires running from a Linux machine. See the comments in that script for details.

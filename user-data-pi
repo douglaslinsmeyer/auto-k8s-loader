@@ -1,15 +1,25 @@
 #cloud-config
-# ── Pi 5 Cloud-Init User Data ────────────────────────────────────────
-# This runs when the Pi first boots from USB.
-# Sets up the user, SSH, and essential packages.
-# The NVMe clone and k3s setup are handled by systemd services.
+# ═══════════════════════════════════════════════════════════════════════
+# K3s Auto-Installer — Pi 5 Cloud-Init (All-in-One)
+# ═══════════════════════════════════════════════════════════════════════
+# This single file contains EVERYTHING needed:
+#   - User/SSH setup
+#   - All k3s bootstrap scripts (embedded via write_files)
+#   - Systemd service definitions (for NVMe boot)
+#   - NVMe clone script (run directly by cloud-init)
+#   - Cluster auto-discovery config
+#
+# Boot flow:
+#   USB boot → cloud-init → packages → write scripts →
+#   run pi-clone-to-nvme.sh → poweroff →
+#   [remove USB] → NVMe boot → k3s-first-boot.service → k3s running
+# ═══════════════════════════════════════════════════════════════════════
 
 hostname: k3s-pi-node
 
 users:
   - name: k3sadmin
-    # Password: k3sadmin (change for production with: mkpasswd --method=SHA-512)
-    passwd: "$6$rounds=4096$randomsalt$ZxC9V8z5N0J1YJqXkEfK3qF7JhV2n5R8wS6tP4mA1bD0gH3iL5oU7yW9xQ2eR4vT6cB8nM0jK1fG3hD5sA7p."
+    passwd: "$6$qTGjOpp7Jfk8Q3Ri$ZkTxkNDfgQlsBW3XqyGOm2jZp8KO3pGLztFWEEau4bYSTHCODFZUtgrcnlw7X0laXu0CvWyVKvQ.Mt.YQnuXE0"
     lock_passwd: false
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -17,7 +27,11 @@ users:
 
 ssh_pwauth: true
 
+chpasswd:
+  expire: false
+
 package_update: true
+package_upgrade: true
 packages:
   - curl
   - open-iscsi
@@ -31,8 +45,360 @@ packages:
   - parted
   - dosfstools
   - rsync
+  - e2fsprogs
   - rpi-eeprom
 
-# Disable the default ubuntu user creation prompt
-chpasswd:
-  expire: false
+# ── write_files: embed all scripts and configs directly ─────────────
+write_files:
+
+  # ── k3s-config.env ────────────────────────────────────────────────
+  - path: /opt/k3s-bootstrap/k3s-config.env
+    permissions: "0644"
+    content: |
+      # K3s Bootstrap Configuration
+      K3S_VERSION=""
+      K3S_TOKEN="6b0356af7e673016c7e2929ebac564a1f00d5b0ea17f8fb549c60627946eeab6"
+      K3S_API_PORT="6443"
+      K3S_MDNS_SERVICE="_k3s-server._tcp"
+      K3S_FORCE_ROLE=""
+      K3S_EXTRA_SERVER_ARGS="--disable traefik"
+      K3S_EXTRA_AGENT_ARGS=""
+      K3S_CLUSTER_CIDR=""
+      K3S_SERVICE_CIDR=""
+      K3S_DISCOVERY_TIMEOUT=30
+
+  # ── first-boot.sh ─────────────────────────────────────────────────
+  - path: /opt/k3s-bootstrap/first-boot.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      LOG_TAG="k3s-first-boot"
+      log() { echo "[$(date -Is)] $*" | tee -a /var/log/k3s-bootstrap.log; logger -t "$LOG_TAG" "$*"; }
+
+      CONFIG="/opt/k3s-bootstrap/k3s-config.env"
+      if [[ ! -f "$CONFIG" ]]; then
+          log "ERROR: Config file $CONFIG not found. Aborting."
+          exit 1
+      fi
+      source "$CONFIG"
+
+      if [[ "${K3S_TOKEN}" == "CHANGE_ME"* ]]; then
+          log "ERROR: K3S_TOKEN has not been set."
+          exit 1
+      fi
+
+      log "Waiting for network connectivity..."
+      for i in $(seq 1 60); do
+          if ping -c1 -W2 1.1.1.1 &>/dev/null; then
+              log "Network is up."
+              break
+          fi
+          sleep 2
+      done
+
+      # Set unique hostname based on MAC
+      MAC_ADDR=$(cat /sys/class/net/$(ip -o link show | awk '!/lo/{gsub(/:$/,"",$2); print $2; exit}')/address 2>/dev/null | tr -d ':' | tail -c 7)
+      NEW_HOSTNAME="k3s-${MAC_ADDR}"
+      hostnamectl set-hostname "$NEW_HOSTNAME"
+      log "Hostname set to $NEW_HOSTNAME"
+
+      # Discover existing k3s servers via mDNS
+      log "Scanning for existing k3s cluster via mDNS (timeout: ${K3S_DISCOVERY_TIMEOUT}s)..."
+      systemctl start avahi-daemon 2>/dev/null || true
+      sleep 3
+
+      DISCOVERED_SERVER=""
+      if command -v avahi-browse &>/dev/null; then
+          BROWSE_OUTPUT=$(timeout "${K3S_DISCOVERY_TIMEOUT}" avahi-browse -rpt "$K3S_MDNS_SERVICE" 2>/dev/null || true)
+          DISCOVERED_SERVER=$(echo "$BROWSE_OUTPUT" | awk -F';' '/^=.*IPv4/ {print $8; exit}')
+      fi
+
+      ROLE=""
+      if [[ -n "${K3S_FORCE_ROLE}" ]]; then
+          ROLE="${K3S_FORCE_ROLE}"
+          log "Role forced via config: $ROLE"
+      elif [[ -n "$DISCOVERED_SERVER" ]]; then
+          ROLE="agent"
+          log "Discovered existing server at $DISCOVERED_SERVER -> joining as agent"
+      else
+          ROLE="server"
+          log "No existing cluster found -> initialising as server"
+      fi
+
+      INSTALL_URL="https://get.k3s.io"
+
+      if [[ "$ROLE" == "server" ]]; then
+          log "Installing k3s SERVER..."
+          EXTRA_ARGS="${K3S_EXTRA_SERVER_ARGS}"
+          [[ -n "${K3S_CLUSTER_CIDR}" ]] && EXTRA_ARGS+=" --cluster-cidr=${K3S_CLUSTER_CIDR}"
+          [[ -n "${K3S_SERVICE_CIDR}" ]] && EXTRA_ARGS+=" --service-cidr=${K3S_SERVICE_CIDR}"
+
+          export K3S_TOKEN="${K3S_TOKEN}"
+          export INSTALL_K3S_EXEC="server ${EXTRA_ARGS}"
+          [[ -n "${K3S_VERSION}" ]] && export INSTALL_K3S_VERSION="${K3S_VERSION}"
+          curl -sfL "$INSTALL_URL" | sh -
+
+          # Publish via mDNS
+          log "Publishing mDNS service..."
+          mkdir -p /etc/avahi/services
+          cat > /etc/avahi/services/k3s-server.service <<AVAHI
+      <?xml version="1.0" standalone='no'?>
+      <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+      <service-group>
+        <name replace-wildcards="yes">k3s-server on %h</name>
+        <service>
+          <type>${K3S_MDNS_SERVICE}</type>
+          <port>${K3S_API_PORT}</port>
+        </service>
+      </service-group>
+      AVAHI
+          systemctl restart avahi-daemon
+
+          log "Waiting for k3s server to become ready..."
+          for i in $(seq 1 120); do
+              if /usr/local/bin/k3s kubectl get nodes &>/dev/null; then
+                  log "k3s server is ready."
+                  break
+              fi
+              sleep 2
+          done
+
+          # Make kubeconfig readable and copy to user home
+          chmod 644 /etc/rancher/k3s/k3s.yaml
+          mkdir -p /home/k3sadmin/.kube
+          cp /etc/rancher/k3s/k3s.yaml /home/k3sadmin/.kube/config
+          chown -R k3sadmin:k3sadmin /home/k3sadmin/.kube
+          chmod 600 /home/k3sadmin/.kube/config
+          # Set KUBECONFIG in bashrc so kubectl works without sudo
+          echo 'export KUBECONFIG=~/.kube/config' >> /home/k3sadmin/.bashrc
+      else
+          log "Installing k3s AGENT joining server ${DISCOVERED_SERVER}..."
+          export K3S_URL="https://${DISCOVERED_SERVER}:${K3S_API_PORT}"
+          export K3S_TOKEN="${K3S_TOKEN}"
+          export INSTALL_K3S_EXEC="agent ${K3S_EXTRA_AGENT_ARGS}"
+          [[ -n "${K3S_VERSION}" ]] && export INSTALL_K3S_VERSION="${K3S_VERSION}"
+          curl -sfL "$INSTALL_URL" | sh -
+          log "Waiting for k3s agent to register..."
+          sleep 15
+      fi
+
+      log "First boot complete. Role=$ROLE Host=$(hostname)"
+
+  # ── every-boot.sh ─────────────────────────────────────────────────
+  - path: /opt/k3s-bootstrap/every-boot.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      LOG_TAG="k3s-every-boot"
+      log() { echo "[$(date -Is)] $*" | tee -a /var/log/k3s-bootstrap.log; logger -t "$LOG_TAG" "$*"; }
+
+      CONFIG="/opt/k3s-bootstrap/k3s-config.env"
+      [[ -f "$CONFIG" ]] && source "$CONFIG"
+
+      log "Waiting for network..."
+      for i in $(seq 1 30); do
+          if ip route | grep -q default; then break; fi
+          sleep 2
+      done
+
+      if systemctl is-active --quiet k3s.service 2>/dev/null; then
+          ROLE="server"
+      elif systemctl is-active --quiet k3s-agent.service 2>/dev/null; then
+          ROLE="agent"
+      else
+          ROLE="unknown"
+          log "WARNING: Could not determine k3s role."
+      fi
+
+      log "Boot detected. Role=$ROLE Host=$(hostname)"
+
+      if [[ "$ROLE" == "server" ]]; then
+          if ! systemctl is-active --quiet k3s.service 2>/dev/null; then
+              log "k3s server not running, restarting..."
+              systemctl restart k3s.service || true
+          fi
+          [[ -f /etc/avahi/services/k3s-server.service ]] && systemctl restart avahi-daemon 2>/dev/null || true
+          log "Running node health check..."
+          /usr/local/bin/k3s kubectl get nodes -o wide 2>/dev/null | tee -a /var/log/k3s-bootstrap.log || true
+      elif [[ "$ROLE" == "agent" ]]; then
+          if ! systemctl is-active --quiet k3s-agent.service 2>/dev/null; then
+              log "k3s agent not running, restarting..."
+              systemctl restart k3s-agent.service || true
+          fi
+      fi
+
+      if command -v crictl &>/dev/null; then
+          crictl rmi --prune 2>/dev/null || true
+      fi
+
+      log "Every-boot tasks complete."
+
+  # ── pi-clone-to-nvme.sh ──────────────────────────────────────────
+  - path: /opt/k3s-bootstrap/pi-clone-to-nvme.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      LOG_TAG="pi-clone-nvme"
+      log() { echo "[$(date -Is)] $*" | tee -a /var/log/k3s-bootstrap.log; logger -t "$LOG_TAG" "$*"; }
+
+      if [[ "$(uname -m)" != "aarch64" ]]; then
+          log "Not ARM64. Skipping."
+          exit 0
+      fi
+
+      NVME_DEV="/dev/nvme0n1"
+      if [[ ! -b "$NVME_DEV" ]]; then
+          log "ERROR: No NVMe at $NVME_DEV. Check M.2 HAT."
+          exit 1
+      fi
+
+      ROOT_SOURCE=$(findmnt -n -o SOURCE /)
+      if [[ "$ROOT_SOURCE" == *"nvme"* ]]; then
+          log "Already on NVMe ($ROOT_SOURCE). Skipping."
+          exit 0
+      fi
+
+      log "Booted from USB ($ROOT_SOURCE). Cloning to NVMe..."
+
+      USB_BOOT_DEV=$(findmnt -n -o SOURCE /boot/firmware 2>/dev/null || findmnt -n -o SOURCE /boot 2>/dev/null || true)
+      log "USB root: $ROOT_SOURCE  USB boot: ${USB_BOOT_DEV:-not found}"
+
+      log "Partitioning NVMe..."
+      wipefs -af "$NVME_DEV" >/dev/null 2>&1
+      parted -s "$NVME_DEV" mklabel gpt
+      parted -s "$NVME_DEV" mkpart "boot" fat32 1MiB 513MiB
+      parted -s "$NVME_DEV" set 1 boot on
+      parted -s "$NVME_DEV" mkpart "root" ext4 513MiB 100%
+      sleep 2
+      partprobe "$NVME_DEV" 2>/dev/null || true
+      sleep 2
+
+      NVME_BOOT="${NVME_DEV}p1"
+      NVME_ROOT="${NVME_DEV}p2"
+
+      log "Formatting NVMe..."
+      mkfs.fat -F 32 -n "PI_BOOT" "$NVME_BOOT"
+      mkfs.ext4 -F -L "PI_ROOT" "$NVME_ROOT"
+
+      CLONE_ROOT="/tmp/nvme-root"
+      CLONE_BOOT="/tmp/nvme-boot"
+      mkdir -p "$CLONE_ROOT" "$CLONE_BOOT"
+      mount "$NVME_ROOT" "$CLONE_ROOT"
+      mount "$NVME_BOOT" "$CLONE_BOOT"
+
+      log "Cloning root filesystem (this takes a few minutes)..."
+      rsync -aAXH \
+          --exclude='/tmp/*' --exclude='/proc/*' --exclude='/sys/*' \
+          --exclude='/dev/*' --exclude='/run/*' --exclude='/mnt/*' \
+          --exclude='/media/*' --exclude='/lost+found' \
+          / "$CLONE_ROOT/"
+
+      mkdir -p "$CLONE_ROOT"/{proc,sys,dev,run,tmp,mnt,media}
+      chmod 1777 "$CLONE_ROOT/tmp"
+
+      if [[ -n "$USB_BOOT_DEV" ]]; then
+          log "Cloning boot partition..."
+          rsync -aAXH /boot/firmware/ "$CLONE_BOOT/" 2>/dev/null || \
+          rsync -aAXH /boot/ "$CLONE_BOOT/" 2>/dev/null || true
+      else
+          rsync -aAXH /boot/ "$CLONE_BOOT/" 2>/dev/null || true
+      fi
+
+      NVME_ROOT_UUID=$(blkid -s UUID -o value "$NVME_ROOT")
+      NVME_BOOT_UUID=$(blkid -s UUID -o value "$NVME_BOOT")
+      log "NVMe root UUID: $NVME_ROOT_UUID  boot UUID: $NVME_BOOT_UUID"
+
+      cat > "${CLONE_ROOT}/etc/fstab" <<FSTAB
+      UUID=${NVME_ROOT_UUID}  /               ext4  defaults,noatime  0  1
+      UUID=${NVME_BOOT_UUID}  /boot/firmware  vfat  defaults          0  2
+      FSTAB
+
+      if [[ -f "${CLONE_BOOT}/cmdline.txt" ]]; then
+          sed -i "s|root=[^ ]*|root=UUID=${NVME_ROOT_UUID}|" "${CLONE_BOOT}/cmdline.txt"
+          sed -i "s|root=PARTUUID=[^ ]*|root=UUID=${NVME_ROOT_UUID}|" "${CLONE_BOOT}/cmdline.txt"
+          log "Updated cmdline.txt"
+      fi
+
+      # Mark clone done + first boot pending ON THE NVME
+      touch "${CLONE_ROOT}/opt/k3s-bootstrap/.nvme-clone-done"
+      touch "${CLONE_ROOT}/opt/k3s-bootstrap/.first-boot-pending"
+
+      # Remove cloud-init's "done" state on NVMe so it doesn't re-run
+      rm -rf "${CLONE_ROOT}/var/lib/cloud/instances" 2>/dev/null || true
+
+      # Update EEPROM boot order to NVMe first
+      log "Setting Pi boot order to NVMe..."
+      if command -v rpi-eeprom-config &>/dev/null; then
+          EEPROM_TMP=$(mktemp)
+          rpi-eeprom-config 2>/dev/null | sed '/BOOT_ORDER/d' > "$EEPROM_TMP"
+          echo "BOOT_ORDER=0xf6142" >> "$EEPROM_TMP"
+          rpi-eeprom-config --apply "$EEPROM_TMP" 2>/dev/null || \
+              log "WARNING: Could not update EEPROM. Set BOOT_ORDER=0xf6142 manually."
+          rm -f "$EEPROM_TMP"
+      else
+          log "rpi-eeprom-config not available. Set BOOT_ORDER=0xf6142 manually."
+      fi
+
+      sync
+      umount "$CLONE_BOOT" 2>/dev/null || true
+      umount "$CLONE_ROOT" 2>/dev/null || true
+      sync
+
+      log "NVMe clone complete. Powering off in 10 seconds. Remove USB, then power on."
+      sleep 10
+      poweroff
+
+  # ── systemd: k3s first boot (runs on NVMe after clone) ──────────
+  - path: /etc/systemd/system/k3s-first-boot.service
+    content: |
+      [Unit]
+      Description=K3s first-boot cluster setup
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/opt/k3s-bootstrap/.first-boot-pending
+      ConditionPathExists=/opt/k3s-bootstrap/.nvme-clone-done
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/first-boot.sh
+      ExecStartPost=/bin/rm -f /opt/k3s-bootstrap/.first-boot-pending
+      RemainAfterExit=true
+      TimeoutStartSec=600
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ── systemd: every boot maintenance ──────────────────────────────
+  - path: /etc/systemd/system/k3s-every-boot.service
+    content: |
+      [Unit]
+      Description=K3s every-boot maintenance
+      After=network-online.target k3s.service k3s-agent.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/k3s-bootstrap/every-boot.sh
+      RemainAfterExit=true
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+
+# ── runcmd: the actual boot sequence ────────────────────────────────
+# Cloud-init runs these commands directly. No relying on systemd
+# service activation for the USB boot phase.
+runcmd:
+  - systemctl daemon-reload
+  # Enable services for FUTURE boots (on NVMe)
+  - systemctl enable k3s-first-boot.service
+  - systemctl enable k3s-every-boot.service
+  # Run the NVMe clone DIRECTLY — no systemd indirection
+  # This script ends with poweroff, so nothing after it runs
+  - bash /opt/k3s-bootstrap/pi-clone-to-nvme.sh
