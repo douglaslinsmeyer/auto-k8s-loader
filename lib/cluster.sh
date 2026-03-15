@@ -136,7 +136,10 @@ select_cluster() {
     local profiles=()
     if [[ -d "$CLUSTERS_DIR" ]]; then
         while IFS= read -r f; do
-            [[ -f "$f" ]] && profiles+=("$f")
+            [[ -f "$f" ]] || continue
+            # Skip the example template — it's not a real cluster
+            [[ "$(basename "$f")" == "example.env" ]] && continue
+            profiles+=("$f")
         done < <(ls "${CLUSTERS_DIR}"/*.env 2>/dev/null | sort)
     fi
 

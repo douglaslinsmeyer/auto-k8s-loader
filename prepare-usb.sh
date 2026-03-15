@@ -7,7 +7,7 @@
 #   Part 1:  1 GB    FAT32  ESP — GRUB EFI for x86 UEFI boot
 #   Part 2:  6 GB    ext4   x86 Ubuntu installer (ISO contents + autoinstall)
 #   Part 3:  300 MB  FAT32  Pi boot (firmware, kernel, config.txt, cloud-init)
-#   Part 4:  4 GB    ext4   Pi root filesystem
+#   Part 4:  8 GB    ext4   Pi root filesystem
 #
 # Boot paths:
 #   x86 UEFI → ESP (Part 1) → GRUB → installer on Part 2 → autoinstall → poweroff
@@ -231,7 +231,7 @@ log "  Layout:"
 log "    Part 1:  1 GB    FAT32  ESP (GRUB for x86 UEFI)"
 log "    Part 2:  6 GB    ext4   x86 Ubuntu installer + autoinstall"
 log "    Part 3:  300 MB  FAT32  Pi boot (firmware + cloud-init)"
-log "    Part 4:  4 GB    ext4   Pi root filesystem"
+log "    Part 4:  8 GB    ext4   Pi root filesystem"
 log ""
 log "  ALL DATA ON THIS DEVICE WILL BE DESTROYED."
 log "═══════════════════════════════════════════════════════════════"

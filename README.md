@@ -172,7 +172,7 @@ mkpasswd --method=SHA-512 yourpassword
 Part 1:  1 GB    FAT32  ESP         — GRUB EFI for x86 UEFI boot
 Part 2:  6 GB    ext4   x86-install — Ubuntu ISO contents + autoinstall user-data
 Part 3:  300 MB  FAT32  pi-boot     — Pi firmware, kernel, config.txt, cloud-init
-Part 4:  4 GB    ext4   pi-root     — Pi Ubuntu root filesystem
+Part 4:  8 GB    ext4   pi-root     — Pi Ubuntu root filesystem
 ```
 
 x86 UEFI finds the ESP (Part 1), loads GRUB, which boots the installer from Part 2. Pi firmware scans FAT32 partitions for `config.txt`, finds it on Part 3 (not Part 1, which has no `config.txt`), and boots from Parts 3+4.
