@@ -254,7 +254,7 @@ parted -s "$DEVICE" set 1 esp on
 parted -s "$DEVICE" set 1 boot on
 parted -s "$DEVICE" mkpart "x86-install"  ext4  1025MiB 7169MiB
 parted -s "$DEVICE" mkpart "pi-boot"      fat32 7169MiB 7469MiB
-parted -s "$DEVICE" mkpart "pi-root"      ext4  7469MiB 11569MiB
+parted -s "$DEVICE" mkpart "pi-root"      ext4  7469MiB 15665MiB
 
 sleep 2
 partprobe "$DEVICE" 2>/dev/null || true
@@ -402,15 +402,7 @@ log "  Copying Pi boot partition..."
 rsync -a "$MNT_IMG_BOOT/" "$MNT_PIBOOT/"
 
 log "  Copying Pi root filesystem (this takes several minutes)..."
-rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || {
-    RC=$?
-    # rsync exit code 23 = partial transfer (some symlinks failed) — non-fatal for man pages etc.
-    if [[ $RC -eq 23 ]]; then
-        warn "Some symlinks failed to copy (non-critical, likely man pages). Continuing."
-    else
-        die "rsync failed with exit code $RC"
-    fi
-}
+rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || die "rsync failed copying Pi root filesystem."
 
 umount "$MNT_IMG_BOOT"
 umount "$MNT_IMG_ROOT"
