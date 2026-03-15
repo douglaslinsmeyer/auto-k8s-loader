@@ -249,12 +249,14 @@ done
 wipefs -af "$DEVICE" >/dev/null 2>&1
 parted -s "$DEVICE" mklabel gpt
 
-parted -s "$DEVICE" mkpart "ESP"          fat32 1MiB    1025MiB
+# Align all partitions to 64 MiB boundaries — some USB/eSATA bridge chips
+# misreport optimal I/O alignment and choke on unaligned writes.
+parted -s "$DEVICE" mkpart "ESP"          fat32 64MiB   1088MiB
 parted -s "$DEVICE" set 1 esp on
 parted -s "$DEVICE" set 1 boot on
-parted -s "$DEVICE" mkpart "x86-install"  ext4  1025MiB 7169MiB
-parted -s "$DEVICE" mkpart "pi-boot"      fat32 7169MiB 7469MiB
-parted -s "$DEVICE" mkpart "pi-root"      ext4  7469MiB 15665MiB
+parted -s "$DEVICE" mkpart "x86-install"  ext4  1088MiB 7232MiB
+parted -s "$DEVICE" mkpart "pi-boot"      fat32 7232MiB 7552MiB
+parted -s "$DEVICE" mkpart "pi-root"      ext4  7552MiB 15744MiB
 
 sleep 2
 partprobe "$DEVICE" 2>/dev/null || true
@@ -291,7 +293,7 @@ mount -o loop,ro "$X86_ISO" "$MNT_ISO" || die "Could not mount ISO."
 
 # Copy ISO contents to x86 installer partition
 log "  Copying x86 ISO contents to Part 2 (~2.5 GB)..."
-rsync -a --info=progress2 --bwlimit=30000 "$MNT_ISO/" "$MNT_X86/"
+rsync -a --info=progress2 --bwlimit=20000 "$MNT_ISO/" "$MNT_X86/"
 
 # Set up GRUB on ESP
 log "  Setting up GRUB on ESP..."
@@ -402,7 +404,7 @@ log "  Copying Pi boot partition..."
 rsync -a "$MNT_IMG_BOOT/" "$MNT_PIBOOT/"
 
 log "  Copying Pi root filesystem (this takes several minutes)..."
-rsync -aAXH --info=progress2 --bwlimit=30000 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || die "rsync failed copying Pi root filesystem."
+rsync -aAXH --info=progress2 --bwlimit=5000 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || die "rsync failed copying Pi root filesystem."
 
 umount "$MNT_IMG_BOOT"
 umount "$MNT_IMG_ROOT"
