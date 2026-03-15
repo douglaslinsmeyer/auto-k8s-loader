@@ -20,7 +20,7 @@
 # Usage:  sudo ./prepare-usb.sh /dev/sdX
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
@@ -28,10 +28,100 @@ die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 # ── Validate ────────────────────────────────────────────────────────────
 [[ "$(uname)" != "Linux" ]] && die "This script must be run from Linux."
 [[ $EUID -ne 0 ]] && die "Must run as root (sudo)."
-[[ $# -lt 1 ]] && { echo "Usage: sudo $0 /dev/sdX"; echo "Run 'lsblk' to find your USB/eSATA drive."; exit 1; }
 
-DEVICE="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Interactive disk selection (Linux) ──────────────────────────────────
+pick_disk_linux() {
+    ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's/[0-9]*$//' | sed 's/p[0-9]*$//')
+    ROOT_DISK=$(basename "$ROOT_DEV")
+    MIN_SIZE_GB=8
+
+    echo ""
+    echo -e "${BOLD}Scanning for USB drives...${NC}"
+    echo ""
+
+    local disks=()
+    local i=1
+    while IFS= read -r line; do
+        local name=$(echo "$line" | awk '{print $1}')
+        local size=$(echo "$line" | awk '{print $2}')
+        local type=$(echo "$line" | awk '{print $3}')
+        local tran=$(echo "$line" | awk '{print $4}')
+        local model=$(echo "$line" | awk '{$1=$2=$3=$4=""; gsub(/^ +/,"",$0); print}')
+
+        [[ "$type" != "disk" ]] && continue
+
+        # Skip boot disk
+        if [[ "/dev/$name" == "$ROOT_DEV"* ]] || [[ "$name" == "$ROOT_DISK" ]]; then
+            continue
+        fi
+
+        # Only show USB drives
+        [[ "$tran" != "usb" ]] && continue
+
+        # Skip drives smaller than 8 GB
+        local size_bytes=$(lsblk -bdno SIZE "/dev/$name" 2>/dev/null)
+        [[ -n "$size_bytes" ]] && (( size_bytes < MIN_SIZE_GB * 1000000000 )) && continue
+
+        # Check for existing k3s labels (previously prepared drive)
+        local labels=""
+        for lbl in $(lsblk -no LABEL "/dev/$name" 2>/dev/null); do
+            case "$lbl" in
+                K3S_EFI|K3S_PIBOOT|K3S_X86|K3S_PIROOT|system-boot)
+                    labels="${labels:+$labels, }$lbl" ;;
+            esac
+        done
+
+        echo -e "  ${GREEN}${i})${NC} /dev/${name}  ${size}"
+        [[ -n "$model" && "$model" != " " ]] && echo -e "     ${CYAN}${model}${NC}"
+        [[ -n "$labels" ]] && echo -e "     ${YELLOW}Previously prepared — partitions: ${labels}${NC}"
+
+        disks+=("/dev/$name")
+        ((i++))
+    done < <(lsblk -dno NAME,SIZE,TYPE,TRAN,MODEL 2>/dev/null)
+
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        die "No USB drives found (8 GB+). Plug in your USB/eSATA drive and try again."
+    fi
+
+    echo ""
+
+    # Auto-select if there's exactly one USB drive
+    if [[ ${#disks[@]} -eq 1 ]]; then
+        DEVICE="${disks[0]}"
+        log "Auto-selected ${DEVICE} (only USB drive detected)"
+        return
+    fi
+
+    read -rp "Select disk number [1-$((i-1))]: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+        DEVICE="${disks[$((choice-1))]}"
+    else
+        die "Invalid selection."
+    fi
+}
+
+# ── Parse args ────────────────────────────────────────────────────────
+DEVICE=""
+CLUSTER_ARG=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster) CLUSTER_ARG="$2"; shift 2 ;;
+        -h|--help)
+            echo "Usage: sudo $0 [--cluster NAME] [/dev/sdX]"
+            echo "  --cluster NAME   Use a specific cluster profile"
+            echo "  /dev/sdX         Target disk (interactive if omitted)"
+            exit 0
+            ;;
+        *) DEVICE="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$DEVICE" ]]; then
+    pick_disk_linux
+fi
 
 [[ ! -b "$DEVICE" ]] && die "$DEVICE is not a block device."
 
@@ -39,11 +129,27 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DEV=$(findmnt -n -o SOURCE / | sed 's/[0-9]*$//' | sed 's/p[0-9]*$//')
 [[ "$DEVICE" == "$ROOT_DEV"* ]] && die "Refusing to operate on boot disk ($ROOT_DEV)."
 
+# ── Cluster selection ────────────────────────────────────────────────────
+source "${SCRIPT_DIR}/lib/cluster.sh"
+
+if [[ -n "$CLUSTER_ARG" ]]; then
+    select_cluster "$CLUSTER_ARG"
+else
+    select_cluster
+fi
+
 # ── Required files ──────────────────────────────────────────────────────
-USER_DATA_X86="${SCRIPT_DIR}/user-data-x86"
-USER_DATA_PI="${SCRIPT_DIR}/user-data-pi"
-[[ ! -f "$USER_DATA_X86" ]] && die "user-data-x86 not found in ${SCRIPT_DIR}"
-[[ ! -f "$USER_DATA_PI" ]]  && die "user-data-pi not found in ${SCRIPT_DIR}"
+USER_DATA_X86_TEMPLATE="${SCRIPT_DIR}/user-data-x86.template"
+USER_DATA_PI_TEMPLATE="${SCRIPT_DIR}/user-data-pi.template"
+[[ ! -f "$USER_DATA_X86_TEMPLATE" ]] && die "user-data-x86.template not found in ${SCRIPT_DIR}"
+[[ ! -f "$USER_DATA_PI_TEMPLATE" ]]  && die "user-data-pi.template not found in ${SCRIPT_DIR}"
+
+# Generate user-data from templates with cluster config
+log "Generating user-data for cluster: ${CLUSTER_NAME}"
+USER_DATA_X86="/tmp/user-data-x86-$$"
+USER_DATA_PI="/tmp/user-data-pi-$$"
+apply_cluster_to_template "$USER_DATA_X86_TEMPLATE" "$USER_DATA_X86"
+apply_cluster_to_template "$USER_DATA_PI_TEMPLATE" "$USER_DATA_PI"
 
 # ── Config ──────────────────────────────────────────────────────────────
 X86_ISO_URL="https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-live-server-amd64.iso"

@@ -93,7 +93,7 @@ autoinstall:
 
   # ── User ─────────────────────────────────────────────────────────────
   identity:
-    hostname: k3s-x86-node
+    hostname: k3s-%%CLUSTER_NAME%%-x86
     username: k3sadmin
     password: "$6$qTGjOpp7Jfk8Q3Ri$ZkTxkNDfgQlsBW3XqyGOm2jZp8KO3pGLztFWEEau4bYSTHCODFZUtgrcnlw7X0laXu0CvWyVKvQ.Mt.YQnuXE0"
 
@@ -121,14 +121,14 @@ autoinstall:
     # ── k3s-config.env ──────────────────────────────────────────────
     - |
       cat > /target/opt/k3s-bootstrap/k3s-config.env <<'KEOF'
-      # K3s Bootstrap Configuration
-      K3S_VERSION=""
-      K3S_TOKEN="6b0356af7e673016c7e2929ebac564a1f00d5b0ea17f8fb549c60627946eeab6"
+      # K3s Bootstrap Configuration — cluster: %%CLUSTER_NAME%%
+      K3S_VERSION="%%K3S_VERSION%%"
+      K3S_TOKEN="%%K3S_TOKEN%%"
       K3S_API_PORT="6443"
-      K3S_MDNS_SERVICE="_k3s-server._tcp"
+      K3S_MDNS_SERVICE="%%K3S_MDNS_SERVICE%%"
       K3S_FORCE_ROLE=""
-      K3S_EXTRA_SERVER_ARGS="--disable traefik"
-      K3S_EXTRA_AGENT_ARGS=""
+      K3S_EXTRA_SERVER_ARGS="%%K3S_EXTRA_SERVER_ARGS%%"
+      K3S_EXTRA_AGENT_ARGS="%%K3S_EXTRA_AGENT_ARGS%%"
       K3S_CLUSTER_CIDR=""
       K3S_SERVICE_CIDR=""
       K3S_DISCOVERY_TIMEOUT=30

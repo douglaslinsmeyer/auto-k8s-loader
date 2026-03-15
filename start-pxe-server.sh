@@ -16,14 +16,15 @@
 #   sudo apt install dnsmasq p7zip-full
 #
 # Usage:
-#   sudo ./start-pxe-server.sh
+#   sudo ./start-pxe-server.sh                     # interactive cluster + IP
 #   sudo ./start-pxe-server.sh --ip 192.168.1.100  # specify server IP
+#   sudo ./start-pxe-server.sh --cluster prod       # specify cluster profile
 #
 # On the target x86 machine:
 #   Boot from network (PXE/Onboard NIC IPv4)
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
@@ -33,15 +34,18 @@ PXE_DIR="${SCRIPT_DIR}/pxe"
 TFTP_DIR="${PXE_DIR}/tftp"
 HTTP_DIR="${PXE_DIR}/http"
 SERVER_IP=""
+CLUSTER_ARG=""
 
 # ── Parse args ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ip) SERVER_IP="$2"; shift 2 ;;
+        --ip)      SERVER_IP="$2"; shift 2 ;;
+        --cluster) CLUSTER_ARG="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: sudo $0 [--ip SERVER_IP]"
+            echo "Usage: sudo $0 [--cluster NAME] [--ip SERVER_IP]"
             echo ""
-            echo "  --ip    Your machine's LAN IP (auto-detected if omitted)"
+            echo "  --cluster NAME   Use a specific cluster profile"
+            echo "  --ip IP          Your machine's LAN IP (auto-detected if omitted)"
             exit 0
             ;;
         *) die "Unknown argument: $1" ;;
@@ -51,29 +55,129 @@ done
 # ── Check root ──────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && die "Must run as root (sudo)."
 
-# ── Detect IP ───────────────────────────────────────────────────────────
-if [[ -z "$SERVER_IP" ]]; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-        SERVER_IP=$(ipconfig getifaddr en0 2>/dev/null || true)
-        [[ -z "$SERVER_IP" ]] && SERVER_IP=$(ipconfig getifaddr en1 2>/dev/null || true)
-    else
-        SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# ── Cluster selection ─────────────────────────────────────────────────
+source "${SCRIPT_DIR}/lib/cluster.sh"
+
+if [[ -n "$CLUSTER_ARG" ]]; then
+    select_cluster "$CLUSTER_ARG"
+else
+    select_cluster
+fi
+
+# ── Install dependencies ────────────────────────────────────────────────
+install_deps() {
+    local missing=()
+    for cmd in dnsmasq curl 7z; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return
     fi
-    [[ -z "$SERVER_IP" ]] && die "Could not detect LAN IP. Pass it with --ip"
+
+    log "Missing tools: ${missing[*]}"
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        if ! command -v brew &>/dev/null; then
+            die "Homebrew is required to install dependencies. Install from https://brew.sh"
+        fi
+        local brew_pkgs=()
+        for cmd in "${missing[@]}"; do
+            case "$cmd" in
+                dnsmasq) brew_pkgs+=("dnsmasq") ;;
+                7z)      brew_pkgs+=("p7zip") ;;
+                curl)    brew_pkgs+=("curl") ;;
+            esac
+        done
+        if [[ ${#brew_pkgs[@]} -gt 0 ]]; then
+            log "Installing via brew: ${brew_pkgs[*]}"
+            sudo -u "${SUDO_USER:-$USER}" brew install "${brew_pkgs[@]}" || die "brew install failed"
+        fi
+    else
+        local apt_pkgs=()
+        for cmd in "${missing[@]}"; do
+            case "$cmd" in
+                dnsmasq) apt_pkgs+=("dnsmasq") ;;
+                7z)      apt_pkgs+=("p7zip-full") ;;
+                curl)    apt_pkgs+=("curl") ;;
+            esac
+        done
+        if [[ ${#apt_pkgs[@]} -gt 0 ]]; then
+            log "Installing via apt: ${apt_pkgs[*]}"
+            apt-get update -qq && apt-get install -y -qq "${apt_pkgs[@]}" || die "apt install failed"
+        fi
+    fi
+}
+
+install_deps
+
+HAS_7Z=false
+command -v 7z &>/dev/null && HAS_7Z=true
+
+# ── Detect IP ───────────────────────────────────────────────────────────
+pick_interface() {
+    echo ""
+    echo -e "${BOLD:-}Network interfaces with IP addresses:${NC}"
+    echo ""
+
+    local ifaces=()
+    local ips=()
+    local i=1
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        while IFS= read -r iface; do
+            local ip=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
+            [[ -z "$ip" ]] && continue
+            local hw=$(networksetup -listallhardwareports 2>/dev/null | grep -A1 "Device: $iface" | head -1 | sed 's/Hardware Port: //')
+
+            echo -e "  ${GREEN}${i})${NC} ${iface}  ${BOLD:-}${ip}${NC}"
+            [[ -n "$hw" ]] && echo -e "     ${CYAN:-}${hw}${NC}"
+
+            ifaces+=("$iface")
+            ips+=("$ip")
+            ((i++))
+        done < <(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -v '^lo')
+    else
+        while IFS= read -r line; do
+            local iface=$(echo "$line" | awk '{print $1}')
+            local ip=$(echo "$line" | awk '{print $2}')
+            [[ -z "$ip" || "$ip" == "127."* ]] && continue
+
+            echo -e "  ${GREEN}${i})${NC} ${iface}  ${BOLD:-}${ip}${NC}"
+
+            ifaces+=("$iface")
+            ips+=("$ip")
+            ((i++))
+        done < <(ip -4 -o addr show 2>/dev/null | awk '{gsub(/\/.*/,"",$4); print $2, $4}')
+    fi
+
+    if [[ ${#ips[@]} -eq 0 ]]; then
+        die "No network interfaces with IP addresses found."
+    fi
+
+    if [[ ${#ips[@]} -eq 1 ]]; then
+        SERVER_IP="${ips[0]}"
+        log "Using ${ifaces[0]} (${SERVER_IP})"
+        return
+    fi
+
+    echo ""
+    read -rp "Select interface [1-$((i-1))]: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+        SERVER_IP="${ips[$((choice-1))]}"
+    else
+        die "Invalid selection."
+    fi
+}
+
+if [[ -z "$SERVER_IP" ]]; then
+    pick_interface
 fi
 log "Server IP: ${SERVER_IP}"
 
 # Detect subnet for dnsmasq DHCP proxy range
 SUBNET=$(echo "$SERVER_IP" | sed 's/\.[0-9]*$/.0/')
-
-# ── Check dependencies ──────────────────────────────────────────────────
-for cmd in dnsmasq curl; do
-    command -v "$cmd" &>/dev/null || die "$cmd is required. Install with: brew install $cmd (macOS) or apt install $cmd (Linux)"
-done
-
-# Need 7z or ability to mount ISO
-HAS_7Z=false
-command -v 7z &>/dev/null && HAS_7Z=true
 
 # ── Config ──────────────────────────────────────────────────────────────
 X86_ISO_URL="https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-live-server-amd64.iso"
@@ -92,8 +196,14 @@ if [[ ! -f "$X86_ISO" ]]; then
     done
 fi
 
-USER_DATA_X86="${SCRIPT_DIR}/user-data-x86"
-[[ ! -f "$USER_DATA_X86" ]] && die "user-data-x86 not found in ${SCRIPT_DIR}"
+USER_DATA_TEMPLATE="${SCRIPT_DIR}/user-data-x86.template"
+USER_DATA_X86="/tmp/user-data-x86-$$"
+
+[[ ! -f "$USER_DATA_TEMPLATE" ]] && die "user-data-x86.template not found in ${SCRIPT_DIR}"
+
+# Generate user-data from template with cluster config
+log "Generating user-data for cluster: ${CLUSTER_NAME}"
+apply_cluster_to_template "$USER_DATA_TEMPLATE" "$USER_DATA_X86"
 
 # ── Step 1: Download ISO if needed ──────────────────────────────────────
 if [[ ! -f "$X86_ISO" ]]; then

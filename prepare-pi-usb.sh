@@ -9,21 +9,113 @@
 #   3. Mounts the FAT32 boot partition
 #   4. Injects the cloud-init user-data (which contains ALL scripts)
 #
-# Usage:  sudo ./prepare-pi-usb.sh /dev/diskN
+# Usage:
+#   sudo ./prepare-pi-usb.sh             # interactive disk selection
+#   sudo ./prepare-pi-usb.sh /dev/diskN  # specify disk directly
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
-# ── Validate ────────────────────────────────────────────────────────
-[[ $# -lt 1 ]] && { echo "Usage: sudo $0 /dev/diskN"; echo "Run 'diskutil list' to find your USB drive."; exit 1; }
+[[ $EUID -ne 0 ]] && die "Must run as root (sudo)."
 
-DEVICE="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-[[ $EUID -ne 0 ]] && die "Must run as root (sudo)."
+# ── Interactive disk selection (macOS) ──────────────────────────────
+pick_disk_macos() {
+    BOOT_DISK=$(diskutil info / 2>/dev/null | awk '/Part of Whole/ {print $NF}')
+    MIN_SIZE_BYTES=8000000000  # 8 GB minimum
+
+    echo ""
+    echo -e "${BOLD}Scanning for USB drives...${NC}"
+    echo ""
+
+    local disks=()
+    local i=1
+    while IFS= read -r disk; do
+        [[ "$disk" == "$BOOT_DISK" ]] && continue
+
+        local proto=$(diskutil info "/dev/$disk" 2>/dev/null | awk -F: '/Protocol/ {gsub(/^ +/,"",$2); print $2}')
+        # Only show USB drives
+        [[ "$proto" != "USB" ]] && continue
+
+        local size_str=$(diskutil info "/dev/$disk" 2>/dev/null | awk -F: '/Disk Size/ {gsub(/^ +/,"",$2); print $2}' | head -1)
+        local size_bytes=$(diskutil info "/dev/$disk" 2>/dev/null | grep 'Disk Size' | grep -oE '[0-9]+ Bytes' | awk '{print $1}')
+        # Skip drives smaller than 8 GB
+        if [[ -n "$size_bytes" ]] && [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+            (( size_bytes < MIN_SIZE_BYTES )) && continue
+        fi
+
+        local media=$(diskutil info "/dev/$disk" 2>/dev/null | awk -F: '/Media Name/ {gsub(/^ +/,"",$2); print $2}')
+
+        # Check for existing k3s labels (previously prepared drive)
+        local labels=""
+        for part_num in 1 2 3 4; do
+            local lbl=$(diskutil info "/dev/${disk}s${part_num}" 2>/dev/null | awk -F: '/Volume Name/ {gsub(/^ +/,"",$2); print $2}')
+            case "$lbl" in
+                K3S_EFI|K3S_PIBOOT|K3S_X86|K3S_PIROOT|system-boot)
+                    labels="${labels:+$labels, }$lbl" ;;
+            esac
+        done
+
+        echo -e "  ${GREEN}${i})${NC} /dev/${disk}  ${size_str:-unknown size}"
+        [[ -n "$media" ]] && echo -e "     ${CYAN}${media}${NC}"
+        [[ -n "$labels" ]] && echo -e "     ${YELLOW}Previously prepared — partitions: ${labels}${NC}"
+
+        disks+=("/dev/$disk")
+        ((i++))
+    done < <(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]/ {gsub(/\/dev\//,"",$1); gsub(/[^a-z0-9]/,"",$1); print $1}')
+
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        die "No USB drives found (8 GB+). Plug in your USB/eSATA drive and try again."
+    fi
+
+    echo ""
+
+    # Auto-select if there's exactly one USB drive
+    if [[ ${#disks[@]} -eq 1 ]]; then
+        DEVICE="${disks[0]}"
+        log "Auto-selected ${DEVICE} (only USB drive detected)"
+        return
+    fi
+
+    read -rp "Select disk number [1-$((i-1))]: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+        DEVICE="${disks[$((choice-1))]}"
+    else
+        die "Invalid selection."
+    fi
+}
+
+# ── Parse args ─────────────────────────────────────────────────────
+DEVICE=""
+CLUSTER_ARG=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster) CLUSTER_ARG="$2"; shift 2 ;;
+        -h|--help)
+            echo "Usage: sudo $0 [--cluster NAME] [/dev/diskN]"
+            echo "  --cluster NAME   Use a specific cluster profile"
+            echo "  /dev/diskN       Target disk (interactive if omitted)"
+            exit 0
+            ;;
+        *) DEVICE="$1"; shift ;;
+    esac
+done
+
+# ── Disk selection ─────────────────────────────────────────────────
+if [[ -z "$DEVICE" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+        pick_disk_macos
+    else
+        echo "Usage: sudo $0 [--cluster NAME] /dev/diskN"
+        echo "Run 'diskutil list' (macOS) or 'lsblk' (Linux) to find your USB drive."
+        exit 1
+    fi
+fi
 
 # Safety: refuse boot disk
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -31,13 +123,27 @@ if [[ "$(uname)" == "Darwin" ]]; then
     [[ "$DEVICE" == *"$BOOT_DISK"* ]] && die "Refusing to operate on boot disk ($BOOT_DISK)."
 fi
 
+# ── Cluster selection ──────────────────────────────────────────────
+source "${SCRIPT_DIR}/lib/cluster.sh"
+
+if [[ -n "$CLUSTER_ARG" ]]; then
+    select_cluster "$CLUSTER_ARG"
+else
+    select_cluster
+fi
+
 # ── Config ──────────────────────────────────────────────────────────
 IMG_URL="https://cdimage.ubuntu.com/releases/24.04.4/release/ubuntu-24.04.4-preinstalled-server-arm64+raspi.img.xz"
 IMG_XZ="${SCRIPT_DIR}/ubuntu-24.04-pi-arm64.img.xz"
 IMG="${SCRIPT_DIR}/ubuntu-24.04-pi-arm64.img"
-USER_DATA="${SCRIPT_DIR}/user-data-pi"
+USER_DATA_TEMPLATE="${SCRIPT_DIR}/user-data-pi.template"
+USER_DATA="/tmp/user-data-pi-$$"
 
-[[ ! -f "$USER_DATA" ]] && die "user-data-pi not found in ${SCRIPT_DIR}"
+[[ ! -f "$USER_DATA_TEMPLATE" ]] && die "user-data-pi.template not found in ${SCRIPT_DIR}"
+
+# Generate user-data from template with cluster config
+log "Generating user-data for cluster: ${CLUSTER_NAME}"
+apply_cluster_to_template "$USER_DATA_TEMPLATE" "$USER_DATA"
 
 # ── Step 1: Download Pi image ───────────────────────────────────────
 if [[ -f "$IMG" ]]; then

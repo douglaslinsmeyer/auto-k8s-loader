@@ -1,12 +1,14 @@
-# K3s Auto-Installer USB — Dual Architecture
+# K3s Auto-Installer — Dual Architecture, Multi-Cluster
 
 One USB/eSATA drive that auto-installs Ubuntu 24.04 + k3s on both x86_64 machines and Raspberry Pi 5 with NVMe. Plug in, power on, walk away. First node creates the cluster; subsequent nodes auto-join via mDNS.
+
+Supports multiple independent clusters via named profiles — each with its own token, mDNS service, and k3s configuration.
 
 ## How It Works
 
 ### x86_64 (Intel/AMD)
 
-1. Machine boots from USB via UEFI
+1. Machine boots from USB via UEFI (or PXE)
 2. GRUB loads Ubuntu autoinstall (3-second timeout)
 3. Ubuntu installs unattended to internal disk, injects k3s scripts via `late-commands`
 4. Machine powers off — you remove the USB
@@ -24,9 +26,40 @@ One USB/eSATA drive that auto-installs Ubuntu 24.04 + k3s on both x86_64 machine
 
 ### Cluster Auto-Discovery
 
-The first node (either architecture) finds no existing k3s servers via mDNS and initialises as a server. It publishes `_k3s-server._tcp` via Avahi. Every subsequent node discovers this and joins as an agent.
+The first node (either architecture) finds no existing k3s servers via mDNS and initialises as a server. It publishes the cluster's mDNS service via Avahi. Every subsequent node discovers this and joins as an agent. Each cluster uses a unique mDNS service name to prevent cross-cluster joins.
 
-Override with the `K3S_FORCE_ROLE` setting if needed.
+Override with the `K3S_FORCE_ROLE` setting in the cluster profile if needed.
+
+## Multi-Cluster Support
+
+Cluster profiles live in `clusters/*.env`. Each profile contains a cluster name, token, mDNS service type, and k3s arguments. All prep scripts prompt you to select a cluster (or create a new one) before flashing.
+
+```bash
+# List clusters and pick one interactively
+sudo bash prepare-usb.sh
+
+# Use a specific cluster by name
+sudo bash prepare-usb.sh --cluster mes-edge /dev/sdX
+
+# Create a new cluster (interactive wizard if no profiles exist)
+sudo bash prepare-usb.sh
+# → select "n) Create a new cluster"
+```
+
+To create a cluster profile manually:
+
+```bash
+cat > clusters/my-cluster.env <<'EOF'
+CLUSTER_NAME="my-cluster"
+K3S_TOKEN="$(openssl rand -hex 32)"
+K3S_MDNS_SERVICE="_k3s-my-cluster._tcp"
+K3S_EXTRA_SERVER_ARGS="--disable traefik"
+K3S_EXTRA_AGENT_ARGS=""
+K3S_VERSION=""
+EOF
+```
+
+All nodes in a cluster must share the same token. The mDNS service name isolates clusters on the same network.
 
 ## Prerequisites
 
@@ -40,9 +73,14 @@ Override with the `K3S_FORCE_ROLE` setting if needed.
 - macOS with `xz` installed (`brew install xz`)
 - USB/eSATA drive (8 GB minimum)
 
+### For PXE boot (x86 machines that can't boot from USB)
+
+- macOS or Linux machine on the same LAN
+- Dependencies installed automatically by the script (`dnsmasq`, `p7zip`)
+
 ### Target machines
 
-- x86_64: UEFI boot support
+- x86_64: UEFI boot support (USB or PXE)
 - Pi 5: NVMe SSD via M.2 HAT, USB in EEPROM boot order
 
 ## Quick Start
@@ -57,11 +95,8 @@ ssh k3sadmin@<pi-ip>
 git clone https://github.com/<user>/auto-k8s-loader.git
 cd auto-k8s-loader
 
-# Find your USB/eSATA device
-lsblk
-
-# Flash the drive
-sudo bash prepare-usb.sh /dev/sdX
+# Flash the drive (interactive disk + cluster selection)
+sudo bash prepare-usb.sh
 ```
 
 This downloads both images (~4.5 GB total), partitions the drive (ESP + x86 installer + Pi boot + Pi root), and injects all configs. Takes about 10-15 minutes.
@@ -69,8 +104,15 @@ This downloads both images (~4.5 GB total), partitions the drive (ESP + x86 inst
 ### Option B: Pi-only drive (from macOS)
 
 ```bash
-brew install xz    # if not already installed
-sudo bash prepare-pi-usb.sh /dev/diskN    # replace with your device
+brew install xz
+sudo bash prepare-pi-usb.sh
+```
+
+### Option C: PXE boot for x86 (from macOS or Linux)
+
+```bash
+sudo bash start-pxe-server.sh
+# On target x86 machine: boot from network (PXE / Onboard NIC IPv4)
 ```
 
 ### Deploy
@@ -81,15 +123,19 @@ sudo bash prepare-pi-usb.sh /dev/diskN    # replace with your device
 4. Remove USB, power on — k3s bootstraps on first boot
 5. Plug the same USB into the next machine and repeat
 
-## Edit Your Cluster Token
-
-Open `user-data-pi` and `user-data-x86` and find the `K3S_TOKEN` line. The current token is pre-generated but you can replace it:
+### Fetch Kubeconfig
 
 ```bash
-openssl rand -hex 32
-```
+# Auto-discover server via mDNS and save kubeconfig
+./fetch-kubeconfig.sh --cluster mes-edge
 
-All nodes must share the same token. Update it in both user-data files.
+# Or specify server IP directly
+./fetch-kubeconfig.sh --cluster mes-edge 192.168.8.188
+
+# Use it
+export KUBECONFIG=~/.kube/config-mes-edge
+kubectl get nodes
+```
 
 ## Files
 
@@ -97,12 +143,14 @@ All nodes must share the same token. Update it in both user-data files.
 |---|---|
 | `prepare-usb.sh` | Dual-arch drive prep (runs on Linux) |
 | `prepare-pi-usb.sh` | Pi-only drive prep (runs on macOS) |
-| `user-data-x86` | Ubuntu autoinstall config with embedded k3s scripts |
-| `user-data-pi` | Cloud-init config with embedded k3s scripts |
-| `k3s-config.env` | Reference copy of cluster config (actual config is embedded in user-data files) |
-| `meta-data` | Empty file required by cloud-init |
+| `start-pxe-server.sh` | PXE boot server for x86 machines |
+| `fetch-kubeconfig.sh` | Fetches kubeconfig from the k3s server node |
+| `user-data-x86.template` | Ubuntu autoinstall template with embedded k3s scripts |
+| `user-data-pi.template` | Cloud-init template with embedded k3s scripts |
+| `lib/cluster.sh` | Shared cluster profile management library |
+| `clusters/*.env` | Cluster profiles (token, mDNS, k3s args) |
 
-Everything (first-boot.sh, every-boot.sh, pi-clone-to-nvme.sh, systemd units) is embedded inside the user-data files.
+Everything (first-boot.sh, every-boot.sh, pi-clone-to-nvme.sh, systemd units) is embedded inside the user-data template files. Cluster-specific values are substituted at prep time via `%%PLACEHOLDER%%` syntax.
 
 ## Default Credentials
 
@@ -112,7 +160,7 @@ Everything (first-boot.sh, every-boot.sh, pi-clone-to-nvme.sh, systemd units) is
 | Password | `k3sadmin` |
 | SSH | Enabled (password auth) |
 
-Change for production by updating the password hash in both user-data files:
+Change for production by updating the password hash in both template files:
 
 ```bash
 mkpasswd --method=SHA-512 yourpassword
@@ -143,7 +191,7 @@ tail -f /var/log/k3s-bootstrap.log
 journalctl -f -u k3s-first-boot.service
 
 # Check cluster
-export KUBECONFIG=~/.kube/config
+export KUBECONFIG=~/.kube/config-<cluster-name>
 kubectl get nodes
 ```
 

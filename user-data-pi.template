@@ -15,7 +15,7 @@
 #   [remove USB] → NVMe boot → k3s-first-boot.service → k3s running
 # ═══════════════════════════════════════════════════════════════════════
 
-hostname: k3s-pi-node
+hostname: k3s-%%CLUSTER_NAME%%-pi
 
 users:
   - name: k3sadmin
@@ -55,14 +55,14 @@ write_files:
   - path: /opt/k3s-bootstrap/k3s-config.env
     permissions: "0644"
     content: |
-      # K3s Bootstrap Configuration
-      K3S_VERSION=""
-      K3S_TOKEN="6b0356af7e673016c7e2929ebac564a1f00d5b0ea17f8fb549c60627946eeab6"
+      # K3s Bootstrap Configuration — cluster: %%CLUSTER_NAME%%
+      K3S_VERSION="%%K3S_VERSION%%"
+      K3S_TOKEN="%%K3S_TOKEN%%"
       K3S_API_PORT="6443"
-      K3S_MDNS_SERVICE="_k3s-server._tcp"
+      K3S_MDNS_SERVICE="%%K3S_MDNS_SERVICE%%"
       K3S_FORCE_ROLE=""
-      K3S_EXTRA_SERVER_ARGS="--disable traefik"
-      K3S_EXTRA_AGENT_ARGS=""
+      K3S_EXTRA_SERVER_ARGS="%%K3S_EXTRA_SERVER_ARGS%%"
+      K3S_EXTRA_AGENT_ARGS="%%K3S_EXTRA_AGENT_ARGS%%"
       K3S_CLUSTER_CIDR=""
       K3S_SERVICE_CIDR=""
       K3S_DISCOVERY_TIMEOUT=30

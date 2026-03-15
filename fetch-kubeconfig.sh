@@ -4,9 +4,10 @@
 # Run from your laptop (macOS or Linux) after the first node is up.
 #
 # Usage:
-#   ./fetch-kubeconfig.sh                  # auto-discover via mDNS
-#   ./fetch-kubeconfig.sh 192.168.8.188    # specify server IP
+#   ./fetch-kubeconfig.sh                          # auto-discover via mDNS
+#   ./fetch-kubeconfig.sh 192.168.8.188            # specify server IP
 #   ./fetch-kubeconfig.sh -u myuser 192.168.8.188  # custom SSH user
+#   ./fetch-kubeconfig.sh --cluster prod           # use cluster's mDNS service
 set -euo pipefail
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -14,34 +15,53 @@ log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSH_USER="k3sadmin"
 SERVER_IP=""
-KUBECONFIG_OUT="${HOME}/.kube/config-k3s"
+KUBECONFIG_OUT=""
+CLUSTER_ARG=""
 
 # ── Parse args ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -u|--user)   SSH_USER="$2"; shift 2 ;;
-        -o|--output) KUBECONFIG_OUT="$2"; shift 2 ;;
+        -u|--user)     SSH_USER="$2"; shift 2 ;;
+        -o|--output)   KUBECONFIG_OUT="$2"; shift 2 ;;
+        --cluster)     CLUSTER_ARG="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [-u user] [-o output_path] [server_ip]"
+            echo "Usage: $0 [--cluster NAME] [-u user] [-o output_path] [server_ip]"
             echo ""
-            echo "  -u, --user     SSH username (default: k3sadmin)"
-            echo "  -o, --output   Output kubeconfig path (default: ~/.kube/config-k3s)"
-            echo "  server_ip      k3s server IP (auto-discovers via mDNS if omitted)"
+            echo "  --cluster NAME   Use a specific cluster profile"
+            echo "  -u, --user       SSH username (default: k3sadmin)"
+            echo "  -o, --output     Output kubeconfig path (default: ~/.kube/config-<cluster>)"
+            echo "  server_ip        k3s server IP (auto-discovers via mDNS if omitted)"
             exit 0
             ;;
-        *)           SERVER_IP="$1"; shift ;;
+        *)             SERVER_IP="$1"; shift ;;
     esac
 done
 
+# ── Cluster selection ─────────────────────────────────────────────────
+source "${SCRIPT_DIR}/lib/cluster.sh"
+
+if [[ -n "$CLUSTER_ARG" ]]; then
+    select_cluster "$CLUSTER_ARG"
+else
+    select_cluster
+fi
+
+# Default output path uses cluster name
+if [[ -z "$KUBECONFIG_OUT" ]]; then
+    KUBECONFIG_OUT="${HOME}/.kube/config-${CLUSTER_NAME}"
+fi
+
 # ── Discover server via mDNS if no IP given ─────────────────────────────
 if [[ -z "$SERVER_IP" ]]; then
-    log "Scanning for k3s server via mDNS..."
+    MDNS_SERVICE="${K3S_MDNS_SERVICE:-_k3s-server._tcp}"
+    log "Scanning for k3s server via mDNS (${MDNS_SERVICE})..."
 
     if [[ "$(uname)" == "Darwin" ]]; then
         # macOS: use dns-sd
-        MDNS_OUTPUT=$(timeout 15 dns-sd -B _k3s-server._tcp local 2>&1 &
+        MDNS_OUTPUT=$(timeout 15 dns-sd -B "${MDNS_SERVICE}" local 2>&1 &
             BGPID=$!
             sleep 5
             kill $BGPID 2>/dev/null
@@ -64,17 +84,17 @@ if [[ -z "$SERVER_IP" ]]; then
 
         # Fallback: try avahi-browse if available
         if [[ -z "$SERVER_IP" ]] && command -v avahi-browse &>/dev/null; then
-            SERVER_IP=$(timeout 15 avahi-browse -rpt _k3s-server._tcp 2>/dev/null | awk -F';' '/^=.*IPv4/ {print $8; exit}')
+            SERVER_IP=$(timeout 15 avahi-browse -rpt "${MDNS_SERVICE}" 2>/dev/null | awk -F';' '/^=.*IPv4/ {print $8; exit}')
         fi
     else
         # Linux: use avahi-browse
         if command -v avahi-browse &>/dev/null; then
-            SERVER_IP=$(timeout 15 avahi-browse -rpt _k3s-server._tcp 2>/dev/null | awk -F';' '/^=.*IPv4/ {print $8; exit}')
+            SERVER_IP=$(timeout 15 avahi-browse -rpt "${MDNS_SERVICE}" 2>/dev/null | awk -F';' '/^=.*IPv4/ {print $8; exit}')
         fi
     fi
 
     if [[ -z "$SERVER_IP" ]]; then
-        die "Could not discover k3s server via mDNS. Pass the server IP manually:\n  $0 192.168.x.x"
+        die "Could not discover k3s server via mDNS (${MDNS_SERVICE}). Pass the server IP manually:\n  $0 --cluster ${CLUSTER_NAME} 192.168.x.x"
     fi
 
     log "Found k3s server at ${SERVER_IP}"
