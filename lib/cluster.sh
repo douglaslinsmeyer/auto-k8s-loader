@@ -74,6 +74,10 @@ create_cluster() {
     local version=""
     read -rp "  Pin k3s version? (leave blank for latest stable): " version
 
+    # Longhorn version
+    local longhorn_version=""
+    read -rp "  Pin Longhorn version? (leave blank for default v1.11.0): " longhorn_version
+
     # Write profile
     mkdir -p "$CLUSTERS_DIR"
     cat > "${CLUSTERS_DIR}/${name}.env" <<ENVEOF
@@ -85,6 +89,7 @@ K3S_MDNS_SERVICE="${mdns}"
 K3S_EXTRA_SERVER_ARGS="${extra_server}"
 K3S_EXTRA_AGENT_ARGS="${extra_agent}"
 K3S_VERSION="${version}"
+LONGHORN_VERSION="${longhorn_version}"
 ENVEOF
 
     echo ""
@@ -97,6 +102,7 @@ ENVEOF
     K3S_EXTRA_SERVER_ARGS="$extra_server"
     K3S_EXTRA_AGENT_ARGS="$extra_agent"
     K3S_VERSION="$version"
+    LONGHORN_VERSION="$longhorn_version"
 }
 
 # ── select_cluster ──────────────────────────────────────────────────────
@@ -205,5 +211,6 @@ apply_cluster_to_template() {
         -e "s|%%K3S_EXTRA_SERVER_ARGS%%|${K3S_EXTRA_SERVER_ARGS}|g" \
         -e "s|%%K3S_EXTRA_AGENT_ARGS%%|${K3S_EXTRA_AGENT_ARGS}|g" \
         -e "s|%%K3S_VERSION%%|${K3S_VERSION}|g" \
+        -e "s|%%LONGHORN_VERSION%%|${LONGHORN_VERSION:-}|g" \
         "$template" > "$output"
 }

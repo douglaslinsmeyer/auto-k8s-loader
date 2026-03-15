@@ -172,6 +172,28 @@ write_files:
           chmod 600 /home/k3sadmin/.kube/config
           # Set KUBECONFIG in bashrc so kubectl works without sudo
           echo 'export KUBECONFIG=~/.kube/config' >> /home/k3sadmin/.bashrc
+
+          # ── Install Longhorn for distributed persistent storage ──
+          LONGHORN_VER="%%LONGHORN_VERSION%%"
+          [[ -z "$LONGHORN_VER" ]] && LONGHORN_VER="v1.11.0"
+          log "Installing Longhorn ${LONGHORN_VER}..."
+          /usr/local/bin/k3s kubectl apply -f \
+              "https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VER}/deploy/longhorn.yaml" \
+              >> "$LOGFILE" 2>&1 || log "WARNING: Longhorn apply failed (will retry on next boot)"
+
+          log "Waiting for Longhorn pods (up to 5 min)..."
+          for li in $(seq 1 60); do
+              LH_READY=$(/usr/local/bin/k3s kubectl -n longhorn-system get pods --no-headers 2>/dev/null | grep -c "Running" || true)
+              LH_TOTAL=$(/usr/local/bin/k3s kubectl -n longhorn-system get pods --no-headers 2>/dev/null | wc -l || true)
+              if [[ "$LH_TOTAL" -gt 0 && "$LH_READY" -eq "$LH_TOTAL" ]]; then
+                  log "Longhorn ready (${LH_READY}/${LH_TOTAL} pods running)"
+                  break
+              fi
+              sleep 5
+          done
+          if [[ "$LH_TOTAL" -eq 0 || "$LH_READY" -ne "$LH_TOTAL" ]]; then
+              log "WARNING: Longhorn not fully ready (${LH_READY:-0}/${LH_TOTAL:-0}). Check: kubectl -n longhorn-system get pods"
+          fi
       else
           log "Installing k3s AGENT joining server ${DISCOVERED_SERVER}..."
           export K3S_URL="https://${DISCOVERED_SERVER}:${K3S_API_PORT}"

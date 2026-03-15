@@ -2,3 +2,5 @@
 *.img.xz
 *.iso
 pxe/
+clusters/*.env
+!clusters/example.env
