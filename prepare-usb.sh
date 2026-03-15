@@ -183,17 +183,20 @@ rsync -a --info=progress2 "$MNT_ISO/" "$MNT_X86/"
 log "  Setting up GRUB on ESP..."
 mkdir -p "${MNT_ESP}/EFI/BOOT"
 
-# Copy GRUB EFI binary from ISO
-if [[ -f "${MNT_ISO}/EFI/BOOT/BOOTx64.EFI" ]]; then
-    cp "${MNT_ISO}/EFI/BOOT/BOOTx64.EFI" "${MNT_ESP}/EFI/BOOT/BOOTX64.EFI"
-elif [[ -f "${MNT_ISO}/EFI/BOOT/BOOTX64.EFI" ]]; then
-    cp "${MNT_ISO}/EFI/BOOT/BOOTX64.EFI" "${MNT_ESP}/EFI/BOOT/BOOTX64.EFI"
+# Copy GRUB EFI binaries from ISO (case-insensitive search)
+EFI_SRC=$(find "${MNT_ISO}/EFI" -iname "bootx64.efi" -print -quit 2>/dev/null)
+if [[ -n "$EFI_SRC" ]]; then
+    cp "$EFI_SRC" "${MNT_ESP}/EFI/BOOT/BOOTX64.EFI"
+    log "  Copied BOOTX64.EFI from $(basename "$(dirname "$EFI_SRC")")"
 else
     warn "No BOOTX64.EFI found in ISO — x86 UEFI boot may not work."
     warn "You may need to copy BOOTX64.EFI to the ESP manually."
 fi
-# Copy grubx64.efi too (some UEFI implementations look for this)
-cp "${MNT_ISO}/EFI/BOOT/grubx64.efi" "${MNT_ESP}/EFI/BOOT/grubx64.efi" 2>/dev/null || true
+# Copy grubx64.efi and mmx64.efi (shim) if present
+for efi in grubx64.efi mmx64.efi; do
+    SRC=$(find "${MNT_ISO}/EFI" -iname "$efi" -print -quit 2>/dev/null)
+    [[ -n "$SRC" ]] && cp "$SRC" "${MNT_ESP}/EFI/BOOT/$efi"
+done
 
 # Copy GRUB modules from ISO
 if [[ -d "${MNT_ISO}/boot/grub" ]]; then
@@ -229,6 +232,30 @@ GRUBCFG
 
 # Also put grub.cfg where GRUB EFI might look for it
 cp "${MNT_ESP}/boot/grub/grub.cfg" "${MNT_ESP}/EFI/BOOT/grub.cfg"
+
+# Overwrite the ISO's grub.cfg on the x86 installer partition
+# GRUB's embedded config searches for /.disk/info, finds it on this partition,
+# then loads boot/grub/grub.cfg from here — so this is the one that actually runs
+log "  Overwriting installer GRUB config with autoinstall version..."
+cat > "${MNT_X86}/boot/grub/grub.cfg" <<X86GRUB
+set timeout=5
+
+loadfont unicode
+
+set menu_color_normal=white/black
+set menu_color_highlight=black/light-gray
+
+menuentry "Install Ubuntu Server - K3s Autoinstall" {
+$(printf '\t')set gfxpayload=keep
+$(printf '\t')linux$(printf '\t')/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/ quiet ---
+$(printf '\t')initrd$(printf '\t')/casper/initrd
+}
+menuentry "Install Ubuntu Server - K3s (Safe Graphics)" {
+$(printf '\t')set gfxpayload=keep
+$(printf '\t')linux$(printf '\t')/casper/vmlinuz autoinstall ds=nocloud\;s=/cdrom/ quiet nomodeset ---
+$(printf '\t')initrd$(printf '\t')/casper/initrd
+}
+X86GRUB
 
 # Inject autoinstall user-data into the x86 installer partition
 # Ubuntu autoinstall with ds=nocloud;s=/cdrom/ looks at the root of the boot source
