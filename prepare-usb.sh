@@ -57,8 +57,16 @@ pick_disk_linux() {
             continue
         fi
 
-        # Only show USB drives
-        [[ "$tran" != "usb" ]] && continue
+        # Only show removable/external drives (USB, eSATA, etc.)
+        # Skip internal drive transports like nvme, and empty transport (SD cards show empty but are usually mmcblk)
+        case "$tran" in
+            usb|sata|ata) ;;  # allow these
+            *) continue ;;
+        esac
+
+        # Skip the boot disk (don't offer to wipe what we're running from)
+        local root_disk=$(lsblk -ndo PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null)
+        [[ "$name" == "$root_disk" ]] && continue
 
         # Skip drives smaller than 8 GB
         local size_bytes=$(lsblk -bdno SIZE "/dev/$name" 2>/dev/null)
@@ -82,7 +90,7 @@ pick_disk_linux() {
     done < <(lsblk -dno NAME,SIZE,TYPE,TRAN,MODEL 2>/dev/null)
 
     if [[ ${#disks[@]} -eq 0 ]]; then
-        die "No USB drives found (8 GB+). Plug in your USB/eSATA drive and try again."
+        die "No external drives found (8 GB+). Plug in your USB/eSATA drive and try again."
     fi
 
     echo ""
