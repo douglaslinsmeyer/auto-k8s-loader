@@ -273,7 +273,7 @@ log "Formatting..."
 mkfs.fat  -F 32 -n "K3S_EFI"    "$P1"
 mkfs.ext4 -F    -L "K3S_X86"    "$P2"
 mkfs.fat  -F 32 -n "K3S_PIBOOT" "$P3"
-mkfs.ext4 -F    -L "K3S_PIROOT" "$P4"
+mkfs.ext4 -F -i 4096 -L "K3S_PIROOT" "$P4"
 
 # ═════════════════════════════════════════════════════════════════════════
 #  STEP 3: Set up x86 installer (ESP + Part 2)
@@ -402,7 +402,15 @@ log "  Copying Pi boot partition..."
 rsync -a "$MNT_IMG_BOOT/" "$MNT_PIBOOT/"
 
 log "  Copying Pi root filesystem (this takes several minutes)..."
-rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/"
+rsync -aAXH --info=progress2 "$MNT_IMG_ROOT/" "$MNT_PIROOT/" || {
+    RC=$?
+    # rsync exit code 23 = partial transfer (some symlinks failed) — non-fatal for man pages etc.
+    if [[ $RC -eq 23 ]]; then
+        warn "Some symlinks failed to copy (non-critical, likely man pages). Continuing."
+    else
+        die "rsync failed with exit code $RC"
+    fi
+}
 
 umount "$MNT_IMG_BOOT"
 umount "$MNT_IMG_ROOT"
